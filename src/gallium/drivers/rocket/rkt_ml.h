@@ -12,7 +12,11 @@
 
 // http://nvdla.org/hw/v1/ias/unit_description.html#convolution-buffer
 #define CBUF_BANK_SIZE        32768
-#define CBUF_BANKS            12
+/* CBUF_BANKS is SoC-specific:
+ *   RK3588: 12 banks (384 KiB CBUF)
+ *   RK3568:  8 banks (256 KiB CBUF) — per RK3568 TRM Part2 section 9.1
+ * TODO: select per-SoC at runtime via rkt_device. */
+#define CBUF_BANKS            8
 #define CBUF_ENTRIES_PER_BANK 256
 #define CBUF_ENTRY_SIZE       (CBUF_BANK_SIZE / CBUF_ENTRIES_PER_BANK)
 #define FEATURE_ATOMIC_SIZE   16

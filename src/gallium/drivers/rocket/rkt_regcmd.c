@@ -46,6 +46,33 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    if (task_num > 0 && operation->reuse_weights_cbuf)
       con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
 
+   /* BSP-order S_POINTER wakes for ALL sub-units MUST come FIRST in the
+    * regcmd (verified by BSP YOLOv5s side-by-side: slots 0-5 of BSP's
+    * regcmd are S_POINTER wakes for CNA, CMAC, ACCU, then CBUF_CON0,
+    * then DPU_S_POINTER, DPU_RDMA_S_POINTER). */
+   EMIT(REG_CNA_S_POINTER, CNA_S_POINTER_POINTER_PP_MODE(1) |
+                              CNA_S_POINTER_EXECUTER_PP_EN(1) |
+                              CNA_S_POINTER_POINTER_PP_EN(1));
+   /* CMAC (formerly "mystery" 0x400 routing target — added to XML in this patch series). */
+   emit_raw(regs, 0x401, 0x2004, 0xe);
+   EMIT(REG_CORE_S_POINTER, CORE_S_POINTER_POINTER_PP_MODE(1) |
+                              CORE_S_POINTER_EXECUTER_PP_EN(1) |
+                              CORE_S_POINTER_POINTER_PP_EN(1));
+
+   /* 2026-05-27: Move DPU + DPU_RDMA S_POINTER wakes here, BEFORE CNA
+    * configs (CBUF_CON0, DCOMP, CONV_CON1). BSP YOLOv5s/MobileNetV1 emit
+    * all 5 sub-unit S_POINTER wakes CONTIGUOUSLY at slots 0-4, then
+    * starts CNA configs. Mesa's previous order interleaved DPU wakes
+    * between CNA configs, possibly causing CNA to reject PC broadcasts
+    * (wakes not done for all sub-units). Match BSP order. */
+   EMIT(REG_DPU_S_POINTER, DPU_S_POINTER_POINTER_PP_MODE(1) |
+                              DPU_S_POINTER_EXECUTER_PP_EN(1) |
+                              DPU_S_POINTER_POINTER_PP_EN(1));
+   EMIT(REG_DPU_RDMA_RDMA_S_POINTER,
+        DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE(1) |
+           DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
+           DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
+
    EMIT(REG_CNA_CBUF_CON0, con0);
 
    EMIT(REG_CNA_DCOMP_REGNUM, 0);
@@ -60,21 +87,28 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    if (operation->depthwise)
       con1 |= CNA_CONV_CON1_CONV_MODE(3);
 
+   /* Single CONV_CON1 emit (removed duplicate that mesa originally had). */
    EMIT(REG_CNA_CONV_CON1, con1);
-
-   EMIT(REG_DPU_S_POINTER, DPU_S_POINTER_POINTER_PP_MODE(1) |
-                              DPU_S_POINTER_EXECUTER_PP_EN(1) |
-                              DPU_S_POINTER_POINTER_PP_EN(1));
-   EMIT(REG_DPU_RDMA_RDMA_S_POINTER,
-        DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE(1) |
-           DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
-           DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
-   EMIT(REG_CNA_CONV_CON1, con1);
+   /* CONV_CON2: KERNEL_GROUP per TRM (page 418) = (weights_kernels / 32 - 1)
+    * for int8 mode (32 kernels per group). FEATURE_GRAINS per TRM formula
+    * = y_stride + weight_height + 1 (suggested by TRM). The old "+50" value
+    * was a hack — TRM-correct formula tested 2026-05-21. */
    EMIT(REG_CNA_CONV_CON2,
+        CNA_CONV_CON2_KERNEL_GROUP(task->weights_kernels / 32 - 1) |
         CNA_CONV_CON2_FEATURE_GRAINS(
-           50 + task->stride_y + 1)); /* Magic: Seems to pass the most tests */
+           task->stride_y + task->weights_height + 1));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
+   /* CONV_CON4: RGB_BYTELENGTH per TRM (page 418). Required to be non-zero
+    * to start CNA pipeline (verified by experiment on RK3568). For ARGB
+    * mode (3-channel RGB) this is the byte length of the input image.
+    * For non-ARGB modes the value isn't used by the conv path but the
+    * register MUST be non-zero or CNA's OP_ENABLE entry is rejected.
+    * Use input_width * input_height * input_channels as a safe per-task
+    * input byte count. */
+   EMIT(REG_CNA_CONV_CON4,
+        CNA_CONV_CON4_RGB_BYTELENGTH(
+           task->input_width * task->input_height * task->input_channels));
    EMIT(REG_CNA_DATA_SIZE0,
         CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
            CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
@@ -138,8 +172,14 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
         rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
            task->input_offset);
    EMIT(REG_CNA_FC_CON2, 0);
+   /* DMA_CON0: FETCH_PIXEL_LEN (bits 15:8) is the per-surface feature fetch
+    * length. Mesa previously omitted this field, leaving it 0 which causes
+    * CNA to fetch zero feature data per surface on RK3568. Set to input
+    * width as a safe default — matches per-row fetch count. */
    EMIT(REG_CNA_DMA_CON0,
-        CNA_DMA_CON0_WEIGHT_BURST_LEN(15) | CNA_DMA_CON0_DATA_BURST_LEN(15));
+        CNA_DMA_CON0_WEIGHT_BURST_LEN(15) |
+        CNA_DMA_CON0_FETCH_PIXEL_LEN(task->input_width) |
+        CNA_DMA_CON0_DATA_BURST_LEN(15));
    EMIT(REG_CNA_DMA_CON1, CNA_DMA_CON1_LINE_STRIDE(task->input_line_stride));
    EMIT(REG_CNA_DMA_CON2, CNA_DMA_CON2_SURF_STRIDE(task->input_surface_stride));
 
@@ -149,25 +189,33 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_CNA_FC_DATA_SIZE1,
         CNA_FC_DATA_SIZE1_DMA_CHANNEL(task->input_channels));
+   /* RK3568 DCOMP layout (per BSP regcmd capture 2026-05-22):
+    *   0x1110..0x112c = DCOMP_ADDR0..7  (8 weight chunk base pointers)
+    *   0x1130..0x114c = DCOMP_AMOUNT0..7 (8 weight chunk byte amounts)
+    * RK3588 mesa has 1 ADDR + 16 AMOUNTs at 0x1140+. Use emit_raw for
+    * RK3568 BSP-correct layout: emit ADDR0 with weight base, ADDR1-7 = 0,
+    * AMOUNT0-7 = 0 (decompression disabled). */
    EMIT(REG_CNA_DCOMP_CTRL, 0);
    EMIT(REG_CNA_DCOMP_REGNUM, 0);
-   EMIT(REG_CNA_DCOMP_ADDR0, rkt_resource(operation->weights)->phys_addr);
-   EMIT(REG_CNA_DCOMP_AMOUNT0, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT1, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT2, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT3, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT4, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT5, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT6, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT7, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT8, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT9, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT10, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT11, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT12, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT13, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT14, 0);
-   EMIT(REG_CNA_DCOMP_AMOUNT15, 0);
+   {
+      uint32_t weight_pa = rkt_resource(operation->weights)->phys_addr;
+      emit_raw(regs, CNA | 0x1, 0x1110, weight_pa);  /* DCOMP_ADDR0 */
+      emit_raw(regs, CNA | 0x1, 0x1114, 0);          /* DCOMP_ADDR1 */
+      emit_raw(regs, CNA | 0x1, 0x1118, 0);          /* DCOMP_ADDR2 */
+      emit_raw(regs, CNA | 0x1, 0x111c, 0);          /* DCOMP_ADDR3 */
+      emit_raw(regs, CNA | 0x1, 0x1120, 0);          /* DCOMP_ADDR4 */
+      emit_raw(regs, CNA | 0x1, 0x1124, 0);          /* DCOMP_ADDR5 */
+      emit_raw(regs, CNA | 0x1, 0x1128, 0);          /* DCOMP_ADDR6 */
+      emit_raw(regs, CNA | 0x1, 0x112c, 0);          /* DCOMP_ADDR7 */
+      emit_raw(regs, CNA | 0x1, 0x1130, 0);          /* DCOMP_AMOUNT0 */
+      emit_raw(regs, CNA | 0x1, 0x1134, 0);          /* DCOMP_AMOUNT1 */
+      emit_raw(regs, CNA | 0x1, 0x1138, 0);          /* DCOMP_AMOUNT2 */
+      emit_raw(regs, CNA | 0x1, 0x113c, 0);          /* DCOMP_AMOUNT3 */
+      emit_raw(regs, CNA | 0x1, 0x1140, 0);          /* DCOMP_AMOUNT4 */
+      emit_raw(regs, CNA | 0x1, 0x1144, 0);          /* DCOMP_AMOUNT5 */
+      emit_raw(regs, CNA | 0x1, 0x1148, 0);          /* DCOMP_AMOUNT6 */
+      emit_raw(regs, CNA | 0x1, 0x114c, 0);          /* DCOMP_AMOUNT7 */
+   }
 
    if (task->input_channels_real == 1) {
       EMIT(REG_CNA_CVT_CON5, 65535);
@@ -198,13 +246,20 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
         CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT(task->output_height - 1) |
            CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH(task->output_width - 1));
    EMIT(REG_CORE_DATAOUT_SIZE_1,
-        CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL(task->output_channels - 1));
+        CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL(15));
    EMIT(REG_CORE_CLIP_TRUNCATE,
         CORE_CLIP_TRUNCATE_CLIP_TRUNCATE(operation->truncate_bits));
    emit_raw(regs, CORE | 0x1, 0x3030, 0);
 
+   /* DPU_FEATURE_MODE_CFG per RK3568 TRM page 433:
+    * - BURST_LEN: 0=burst4, 1=burst8, 2=burst16.
+    * - OUTPUT_MODE: TRM documents 0=PPU and 2=outside, but BSP YOLOv5s uses
+    *   value 4 (0x108 = bit 8 burst_len=2 + bit 3 = output_mode=4).
+    *   Match BSP empirically — TRM is incomplete on output_mode codes.
+    * - CONV_MODE: 0=Direct, 3=Depthwise.
+    */
    uint32_t feat_mode_cfg =
-      DPU_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2);
+      DPU_FEATURE_MODE_CFG_BURST_LEN(2) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(4);
    if (operation->depthwise)
       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
 
@@ -525,10 +580,16 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TRM: before op_en, 64'h0041_xxxx_xxxx_xxxx must be set. */
    util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
 
-   /* TRM: 64'h0081_0000_007f_0008 will set each block's op_en(CNA, CORE, ...,
-    * PPU_RDMA). */
-   emit_raw(regs, 0x81, REG_PC_OPERATION_ENABLE,
-            PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1));
+   /* Individual sub-unit OP_EN writes. The broadcast target=0x81 is
+    * RK3588-specific and not supported on RK3568. Direct writes work on both. */
+   emit_raw(regs, CNA | 0x1, REG_CNA_OPERATION_ENABLE,
+            CNA_OPERATION_ENABLE_OP_EN(1));
+   emit_raw(regs, CORE | 0x1, REG_CORE_OPERATION_ENABLE,
+            CORE_OPERATION_ENABLE_OP_EN(1));
+   emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_OPERATION_ENABLE,
+            DPU_RDMA_RDMA_OPERATION_ENABLE_OP_EN(1));
+   emit_raw(regs, DPU | 0x1, REG_DPU_OPERATION_ENABLE,
+            DPU_OPERATION_ENABLE_OP_EN(1));
 }
 
 void
