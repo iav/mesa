@@ -206,6 +206,10 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       <bitfield name="CONV_Y_STRIDE" low="3" high="5" type="uint"/>
       <bitfield name="CONV_X_STRIDE" low="0" high="2" type="uint"/>
    </reg32>
+   <reg32 offset="0x1018" name="CONV_CON4">
+      <bitfield name="RESERVED_0" low="24" high="31" type="uint"/>
+      <bitfield name="RGB_BYTELENGTH" low="0" high="23" type="uint"/>
+   </reg32>
    <reg32 offset="0x1020" name="DATA_SIZE0">
       <bitfield name="RESERVED_0" low="27" high="31" type="uint"/>
       <bitfield name="DATAIN_WIDTH" low="16" high="26" type="uint"/>
@@ -306,7 +310,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       <bitfield name="OV4K_BYPASS" pos="31" type="uint"/>
       <bitfield name="RESERVED_0" low="20" high="30" type="uint"/>
       <bitfield name="WEIGHT_BURST_LEN" low="16" high="19" type="uint"/>
-      <bitfield name="RESERVED_1" low="4" high="15" type="uint"/>
+      <bitfield name="FETCH_PIXEL_LEN" low="8" high="15" type="uint"/>
+      <bitfield name="RESERVED_1" low="4" high="7" type="uint"/>
       <bitfield name="DATA_BURST_LEN" low="0" high="3" type="uint"/>
    </reg32>
    <reg32 offset="0x107C" name="DMA_CON1">
@@ -474,14 +479,17 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       <bitfield name="OP_EN" pos="0" type="uint"/>
    </reg32>
    <reg32 offset="0x400C" name="FEATURE_MODE_CFG">
-      <bitfield name="COMB_USE" pos="31" type="uint"/>
+      <!-- Bit layout per RK3568 TRM Part2 page 433. Was previously
+           wrong: OUTPUT_MODE/CONV_MODE/BURST_LEN at wrong positions. -->
+      <bitfield name="RESERVED_0" pos="31" type="uint"/>
       <bitfield name="TP_EN" pos="30" type="uint"/>
       <bitfield name="RGP_TYPE" low="26" high="29" type="uint"/>
       <bitfield name="NONALIGN" pos="25" type="uint"/>
       <bitfield name="SURF_LEN" low="9" high="24" type="uint"/>
-      <bitfield name="BURST_LEN" low="5" high="8" type="uint"/>
-      <bitfield name="CONV_MODE" low="3" high="4" type="uint"/>
-      <bitfield name="OUTPUT_MODE" low="1" high="2" type="uint"/>
+      <bitfield name="BURST_LEN" low="7" high="8" type="uint"/>
+      <bitfield name="RESERVED_1" pos="6" type="uint"/>
+      <bitfield name="CONV_MODE" low="4" high="5" type="uint"/>
+      <bitfield name="OUTPUT_MODE" low="1" high="3" type="uint"/>
       <bitfield name="FLYING_MODE" pos="0" type="uint"/>
    </reg32>
    <reg32 offset="0x4010" name="DATA_FORMAT">
