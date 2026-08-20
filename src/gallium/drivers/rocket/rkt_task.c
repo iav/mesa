@@ -145,7 +145,11 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    else
       task->weights_kernels = align(operation->output_channels, 2);
 
-   task->surfaces_per_row = task->output_width * task->output_height * 2;
+   /* RK3568 (vendor librknnrt 1.5.2, RE 2026-08-20): DPU SURFACE_ADD is the
+    * output surface size in 16-byte cells = Wout * Hout, i.e. equal to
+    * output_surface_stride.  The previous *2 was an RK3588-era magic
+    * multiplier (elements-vs-cells mismatch). */
+   task->surfaces_per_row = task->output_width * task->output_height;
    if (operation->depthwise)
       task->surfaces_per_row *= 2;
 }
