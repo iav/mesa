@@ -29,9 +29,8 @@ static const struct { uint32_t reg; uint32_t val; } rkt_test_ovr[] = {
    { 0x1018, 0x00000000 },  /* CNA_CONV_CON4 */
    { 0x1044, 0x00500028 },  /* CNA_CBUF_CON1 */
    { 0x1078, 0x00171c07 },  /* CNA_DMA_CON0 */
-   { 0x107c, 0x00000050 },  /* CNA_DMA_CON1 line_stride */
-   { 0x1080, 0x00001900 },  /* CNA_DMA_CON2 surf_stride */
-   { 0x40c0, 0x00006400 },  /* DPU (per MR table) */
+   /* 0x107c, 0x1080, 0x40c0 removed: now produced by proper formulas in
+    * rkt_task.c (line_stride=Win, surf_stride=Win*Hin, surf_add=Wout*Hout). */
 };
 
 static void
