@@ -110,9 +110,13 @@ fill_task(struct rkt_ml_subgraph *subgraph,
          task->input_surface_stride =
             (float)task->input_line_stride * (((float)task->input_height) - 1);
    } else {
-      task->input_line_stride = calc_line_stride(operation->input_width) / 4;
+      /* RK3568 (vendor librknnrt 1.5.2, RE 2026-08-20): both CNA DMA strides
+       * are in 16-byte cells: line_stride = Win, surf_stride = Win * Hin.
+       * The old /4 and (Hin/4 - 1) were RK3588-era magic. */
+      task->input_line_stride =
+         calc_line_stride(operation->input_width) / FEATURE_ATOMIC_SIZE;
       task->input_surface_stride =
-         (float)task->input_line_stride * (((float)task->input_height / 4) - 1);
+         task->input_line_stride * task->input_height;
    }
 
    if (task->input_width == 8 &&
