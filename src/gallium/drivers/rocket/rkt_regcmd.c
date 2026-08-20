@@ -555,7 +555,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
                             DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE(5);
    } else {
-      rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
+      /* TEST (RE 2026-08-21): vendor CNA DMA_CON0 uses burst_len 7 on
+       * RK3568 (mesa 15 left CNA DMA incomplete, Test 13); try the same
+       * burst limit for DPU_RDMA — bias BRDMA never fetches (DT_RD delta
+       * vs vendor = exactly the 512-byte bias buffer). */
+      rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(7) |
                             DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
    }
 
