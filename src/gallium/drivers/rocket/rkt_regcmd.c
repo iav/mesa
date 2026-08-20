@@ -19,10 +19,33 @@ emit_raw(struct util_dynarray *regs, uint32_t target, uint32_t reg,
    util_dynarray_append(regs, packed_value);
 }
 
+/* TEST (iav/droid RE session): optional overrides with the vendor-exact
+ * values for THE reference conv2d (80x80x16 -> 40x40x128, 5x5 s2) from the
+ * MR !42134 byte-exact diff table.  Enabled with RKT_VENDOR_OVR=1.
+ */
+#include <stdlib.h>
+static const struct { uint32_t reg; uint32_t val; } rkt_test_ovr[] = {
+   { 0x1010, 0x00000070 },  /* CNA_CONV_CON2 */
+   { 0x1018, 0x00000000 },  /* CNA_CONV_CON4 */
+   { 0x1044, 0x00500028 },  /* CNA_CBUF_CON1 */
+   { 0x1078, 0x00171c07 },  /* CNA_DMA_CON0 */
+   { 0x107c, 0x00000050 },  /* CNA_DMA_CON1 line_stride */
+   { 0x1080, 0x00001900 },  /* CNA_DMA_CON2 surf_stride */
+   { 0x40c0, 0x00006400 },  /* DPU (per MR table) */
+};
+
 static void
 emit(struct util_dynarray *regs, uint32_t reg, uint32_t value)
 {
    uint32_t target = rkt_get_target(reg) + 0x1;
+   if (getenv("RKT_VENDOR_OVR")) {
+      for (unsigned i = 0; i < ARRAY_SIZE(rkt_test_ovr); i++) {
+         if (rkt_test_ovr[i].reg == reg) {
+            value = rkt_test_ovr[i].val;
+            break;
+         }
+      }
+   }
    emit_raw(regs, target, reg, value);
 }
 
