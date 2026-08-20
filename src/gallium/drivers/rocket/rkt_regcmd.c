@@ -606,11 +606,6 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * RK3588-specific and not supported on RK3568. Direct writes work on both. */
    emit_raw(regs, CNA | 0x1, REG_CNA_OPERATION_ENABLE,
             CNA_OPERATION_ENABLE_OP_EN(1));
-   /* TEST (RE 2026-08-21): CMAC (0x2000 block, routing target 0x4) got its
-    * S_POINTER wake but never an OPERATION_ENABLE — mesa enables only 4 of
-    * the 5 woken sub-units.  Assume the block mirrors the common layout
-    * (0x2008 = OPERATION_ENABLE) and enable it too. */
-   emit_raw(regs, 0x401, 0x2008, 0x1);
    emit_raw(regs, CORE | 0x1, REG_CORE_OPERATION_ENABLE,
             CORE_OPERATION_ENABLE_OP_EN(1));
    emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_OPERATION_ENABLE,
