@@ -121,8 +121,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * for int8 mode (32 kernels per group). FEATURE_GRAINS per TRM formula
     * = y_stride + weight_height + 1 (suggested by TRM). The old "+50" value
     * was a hack — TRM-correct formula tested 2026-05-21. */
+   /* TEST (iav RE, 2026-08-21): the vendor leaves KERNEL_GROUP at zero in all
+    * 51 tasks of mobilenet_v1, including layers with 512 and 1001 kernels.
+    * Mesa's kernels/32 - 1 underflows to 0xff on depthwise, where kernels is
+    * 1 -- and depthwise is exactly what stalls after CNA. */
    EMIT(REG_CNA_CONV_CON2,
-        CNA_CONV_CON2_KERNEL_GROUP(task->weights_kernels / 32 - 1) |
         CNA_CONV_CON2_FEATURE_GRAINS(
            task->stride_y + task->weights_height));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
@@ -165,7 +168,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
     * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
    emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
-            (task->input_width << 16) | task->input_data_entries);
+            (task->input_width << 16) | (task->input_data_entries * 2));
 
    if (task->input_channels_real == 1) {
       unsigned truncate = 14;
@@ -203,8 +206,17 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_CNA_FC_CON0, 0);
    EMIT(REG_CNA_FC_CON1, 0);
-   EMIT(REG_CNA_PAD_CON0, CNA_PAD_CON0_PAD_LEFT(task->pad_left) |
-                             CNA_PAD_CON0_PAD_TOP(task->pad_top));
+   /* TEST (iav RE, 2026-08-21): on RK3568 the pad value lives in the upper half
+    * of PAD_CON0, not in the separate PAD_CON1 register registers.xml lists --
+    * the vendor never writes 0x1184 at all.  Its PAD_CON0 is 0xff800000 /
+    * 0xff800011 for every layer whose input zero point is 0 (that is -128 once
+    * the uint8 tensor is read as int8) and 0x00000000 for the network input,
+    * whose zero point is 128.  So the value is input_zero_point - 0x80, which
+    * is exactly what mesa already computed for PAD_CON1. */
+   EMIT(REG_CNA_PAD_CON0,
+        ((uint32_t)((task->input_zero_point - 0x80) & 0xffff) << 16) |
+           CNA_PAD_CON0_PAD_LEFT(task->pad_left) |
+           CNA_PAD_CON0_PAD_TOP(task->pad_top));
    EMIT(REG_CNA_FEATURE_DATA_ADDR,
         rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
            task->input_offset);
@@ -276,7 +288,8 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    if (operation->depthwise && task->input_zero_point == 0x8b)
       pad_con1 = 0x0b0b;
 
-   EMIT(REG_CNA_PAD_CON1, pad_con1);
+   /* The vendor writes no PAD_CON1; the pad value went into PAD_CON0 above. */
+   (void)pad_con1;
 
    uint32_t misc_cfg = CORE_MISC_CFG_QD_EN(1);
    if (operation->depthwise)
