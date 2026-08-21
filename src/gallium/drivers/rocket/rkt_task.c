@@ -85,7 +85,12 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    task->output_channels_real = operation->output_channels;
    task->output_channels = align(MAX2(operation->output_channels, 32), 32);
-   if (operation->depthwise) {
+   /* TEST (iav RE, 2026-08-21): RK3568 wants the real channel count on
+    * depthwise.  The vendor stream carries 32 channels for every 32-channel
+    * depthwise layer of mobilenet_v1 (DPU_DATA_CUBE_CHANNEL 0x001f001f),
+    * while this doubling made mesa announce 64 to the DPU, which then waited
+    * for data that never arrived and stalled right after CNA. */
+   if (operation->depthwise && false) {
       if (task->output_channels_real <= 32)
          task->output_channels *= 2;
       task->output_channels = align(task->output_channels, 64);
