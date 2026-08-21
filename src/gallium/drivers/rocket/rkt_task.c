@@ -47,8 +47,10 @@ calc_weights_banks(struct rkt_operation *operation)
    entries = DIV_ROUND_UP(bytes, CBUF_ENTRY_SIZE);
    banks = DIV_ROUND_UP(entries, CBUF_ENTRIES_PER_BANK);
 
-   /* Why do we need an extra bank? The calc above might be wrong on this HW */
-   banks++;
+   /* TEST (iav RE, 2026-08-21): the vendor gives this layer one weight bank and
+    * seven data banks (CBUF_CON0 0x17); with the extra bank mesa keeps two and
+    * six, and the 224-wide RGB layer then stalls on its second band. */
+   /* banks++; */
 
    return banks;
 }
