@@ -124,7 +124,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_CNA_CONV_CON2,
         CNA_CONV_CON2_KERNEL_GROUP(task->weights_kernels / 32 - 1) |
         CNA_CONV_CON2_FEATURE_GRAINS(
-           task->stride_y + task->weights_height + 1));
+           task->stride_y + task->weights_height));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
    /* CONV_CON4: RGB_BYTELENGTH per TRM (page 418). Required to be non-zero
@@ -134,9 +134,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * register MUST be non-zero or CNA's OP_ENABLE entry is rejected.
     * Use input_width * input_height * input_channels as a safe per-task
     * input byte count. */
+   /* TEST (iav RE, 2026-08-21): the vendor writes RGB_BYTELENGTH only for the
+    * ARGB first layer and leaves this at zero everywhere else. */
    EMIT(REG_CNA_CONV_CON4,
-        CNA_CONV_CON4_RGB_BYTELENGTH(
-           task->input_width * task->input_height * task->input_channels));
+        con1 ? CNA_CONV_CON4_RGB_BYTELENGTH(task->input_width *
+                                            task->input_height *
+                                            task->input_channels)
+             : 0);
    EMIT(REG_CNA_DATA_SIZE0,
         CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
            CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
@@ -158,7 +162,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_CNA_CBUF_CON0, con0);
 
-   EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
+   /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
+    * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
+   emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
+            (task->input_width << 16) | task->input_data_entries);
 
    if (task->input_channels_real == 1) {
       unsigned truncate = 14;
@@ -183,9 +190,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_CNA_CVT_CON4,
            CNA_CVT_CON4_CVT_SCALE3(scale) | CNA_CVT_CON4_CVT_OFFSET3(offset));
    } else {
+      /* TEST (iav RE, 2026-08-21): the vendor writes 0xa here for all 42
+       * non-ARGB tasks of mobilenet_v1 -- DATA_SIGN and CVT_TYPE set, but
+       * CVT_BYPASS clear.  The converter stays in the path. */
       EMIT(REG_CNA_CVT_CON0, CNA_CVT_CON0_DATA_SIGN(1) |
-                                CNA_CVT_CON0_CVT_TYPE(1) |
-                                CNA_CVT_CON0_CVT_BYPASS(1));
+                                CNA_CVT_CON0_CVT_TYPE(1));
       EMIT(REG_CNA_CVT_CON1, CNA_CVT_CON1_CVT_SCALE0(1));
       EMIT(REG_CNA_CVT_CON2, CNA_CVT_CON2_CVT_SCALE1(1));
       EMIT(REG_CNA_CVT_CON3, CNA_CVT_CON3_CVT_SCALE2(1));
@@ -204,10 +213,14 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * length. Mesa previously omitted this field, leaving it 0 which causes
     * CNA to fetch zero feature data per surface on RK3568. Set to input
     * width as a safe default — matches per-row fetch count. */
+   /* TEST (iav RE, 2026-08-21): the vendor writes the same 0x00171c07 here in
+    * all 44 convolution tasks of mobilenet_v1 and all 23 of resnet18, across
+    * every geometry -- FETCH_PIXEL_LEN is a constant 28, not input_width, and
+    * both burst lengths are 7, not 15. */
    EMIT(REG_CNA_DMA_CON0,
-        CNA_DMA_CON0_WEIGHT_BURST_LEN(15) |
-        CNA_DMA_CON0_FETCH_PIXEL_LEN(task->input_width) |
-        CNA_DMA_CON0_DATA_BURST_LEN(15));
+        CNA_DMA_CON0_WEIGHT_BURST_LEN(7) |
+        CNA_DMA_CON0_FETCH_PIXEL_LEN(28) |
+        CNA_DMA_CON0_DATA_BURST_LEN(7));
    EMIT(REG_CNA_DMA_CON1, CNA_DMA_CON1_LINE_STRIDE(task->input_line_stride));
    EMIT(REG_CNA_DMA_CON2, CNA_DMA_CON2_SURF_STRIDE(task->input_surface_stride));
 
@@ -308,8 +321,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
            task->output_offset);
+   /* TEST (iav RE, 2026-08-21): the vendor stream carries output_width *
+    * output_height / 2 here, half of what mesa emits, on all 44 convolution
+    * tasks of mobilenet_v1 (checked against the full output tensor, not the
+    * per-task band).  DPU_SURFACE_ADD at 0x40c0 keeps the undivided value. */
    EMIT(REG_DPU_DST_SURF_STRIDE,
-        DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(task->output_surface_stride));
+        DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(task->output_surface_stride / 2));
    EMIT(REG_DPU_DATA_CUBE_WIDTH,
         DPU_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_DATA_CUBE_HEIGHT,
