@@ -17,6 +17,11 @@ emit_raw(struct util_dynarray *regs, uint32_t target, uint32_t reg,
    packed_value |= (uint64_t)reg;
 
    util_dynarray_append(regs, packed_value);
+
+   /* TEST (iav RE, 2026-08-21): RKT_DUMP=1 prints the emitted command stream so
+    * it can be diffed against the vendor stream extracted from a .rknn. */
+   if (getenv("RKT_DUMP"))
+      fprintf(stderr, "rkt regcmd %016llx\n", (unsigned long long)packed_value);
 }
 
 /* TEST (iav/droid RE session): optional overrides with the vendor-exact
@@ -24,6 +29,7 @@ emit_raw(struct util_dynarray *regs, uint32_t target, uint32_t reg,
  * MR !42134 byte-exact diff table.  Enabled with RKT_VENDOR_OVR=1.
  */
 #include <stdlib.h>
+#include <stdio.h>
 static const struct { uint32_t reg; uint32_t val; } rkt_test_ovr[] = {
    { 0x1010, 0x00000070 },  /* CNA_CONV_CON2 */
    { 0x1018, 0x00000000 },  /* CNA_CONV_CON4 */
@@ -263,15 +269,26 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    if (operation->depthwise)
       misc_cfg |= CORE_MISC_CFG_DW_EN(1);
 
-   EMIT(REG_CORE_MISC_CFG, misc_cfg);
-   EMIT(REG_CORE_DATAOUT_SIZE_0,
-        CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT(task->output_height - 1) |
-           CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH(task->output_width - 1));
-   EMIT(REG_CORE_DATAOUT_SIZE_1,
-        CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL(15));
-   EMIT(REG_CORE_CLIP_TRUNCATE,
-        CORE_CLIP_TRUNCATE_CLIP_TRUNCATE(operation->truncate_bits));
-   emit_raw(regs, CORE | 0x1, 0x3030, 0);
+   /* TEST (iav RE, 2026-08-21): on RK3568 the CORE block map is one slot lower
+    * than registers.xml claims -- the xml has a spurious MAC_GATING at 0x300c
+    * which shifts everything after it.  The vendor command stream (all 44
+    * convolution tasks of mobilenet_v1) writes:
+    *   0x300c = MISC_CFG      (0, or DW_EN=2 for depthwise; QD_EN never set)
+    *   0x3010 = DATAOUT_SIZE_0 ((height-1) << 16 | (width-1))
+    *   0x3014 = DATAOUT_SIZE_1 (channels - 1)
+    *   0x302c = 0             (what the xml calls 0x3030)
+    * CLIP_TRUNCATE (real 0x3018) is not written at all.
+    * With the xml offsets mesa told CORE its output was 3 wide and 1 high,
+    * so CORE produced nothing and the DPU interrupt never arrived. */
+   /* TEST (iav RE, 2026-08-21): CMAC MISC_CFG sits at 0x200c, the same slot
+    * within its block as CORE's at 0x300c.  The vendor sets QD_EN there for
+    * every task and adds DW_EN for depthwise; mesa never wrote it at all. */
+   emit_raw(regs, 0x401, 0x200c, operation->depthwise ? 0x3 : 0x1);
+   emit_raw(regs, CORE | 0x1, 0x300c, operation->depthwise ? 0x2 : 0x0);
+   emit_raw(regs, CORE | 0x1, 0x3010,
+            ((task->output_height - 1) << 16) | (task->output_width - 1));
+   emit_raw(regs, CORE | 0x1, 0x3014, task->output_channels - 1);
+   emit_raw(regs, CORE | 0x1, 0x302c, 0);
 
    /* DPU_FEATURE_MODE_CFG per RK3568 TRM page 433:
     * - BURST_LEN: 0=burst4, 1=burst8, 2=burst16.
@@ -526,6 +543,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr);
+   /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
+    * and is absent from registers.xml, so mesa never writes it.  The vendor
+    * stream in every .rknn writes output_channels - 1 there for all 51 tasks
+    * of mobilenet_v1 (10 distinct values, all matching).  Without it the bias
+    * RDMA has nothing to fetch, which matches our DT_RD being exactly 512
+    * bytes (one bias buffer) short of the vendor's. */
+   emit_raw(regs, DPU_RDMA | 0x1, 0x5024, task->output_channels - 1);
    EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
 
