@@ -329,6 +329,22 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
          1;
       cur_task->atomic_count = cur_task->output_width * cur_task->output_height;
 
+      /* TEST (iav RE, 2026-08-22): trim the band to the rows the convolution
+       * actually consumes.  Taking every available CBUF slice leaves a spare
+       * input row whenever the slice count is not congruent to the kernel
+       * height modulo the stride -- for the 224-wide first layer of
+       * mobilenet_v1 mesa fed CNA 128 rows where 63 output rows need
+       * (63 - 1) * 2 + 3 = 127.  The vendor stream carries exactly 127. */
+      {
+         unsigned consumed = (cur_task->output_height - 1) * operation->stride +
+                             operation->weights_height;
+         unsigned pad = cur_task->pad_top + cur_task->pad_bottom;
+
+         consumed = consumed > pad ? consumed - pad : 0;
+         if (consumed > 0 && cur_task->input_height > consumed)
+            cur_task->input_height = consumed;
+      }
+
       cur_task->input_offset =
          calc_line_stride(operation->input_width) * cur_task->top_slice;
       cur_task->output_offset =
