@@ -168,7 +168,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
     * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
    emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
-            (task->input_width << 16) | (task->input_data_entries * 2));
+            (task->input_width << 16) | task->input_data_entries);
 
    if (task->input_channels_real == 1) {
       unsigned truncate = 14;
