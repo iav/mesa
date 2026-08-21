@@ -11,7 +11,13 @@
 #include "rkt_device.h"
 
 // http://nvdla.org/hw/v1/ias/unit_description.html#convolution-buffer
-#define CBUF_BANK_SIZE        32768
+/* TEST (iav RE, 2026-08-22): RK3568 banks are 64 KiB, not 32.  Derived from
+ * the vendor command stream: the first convolution of mobilenet_v1 (224 wide,
+ * 7 data banks) is split into bands of 127 and 98 input rows.  At 14 entries
+ * per row that first band needs 128 slices, which only fits if a bank holds
+ * 256 entries of 256 bytes.  With 32768 mesa computed half the capacity and
+ * split the same layer into five bands instead of two. */
+#define CBUF_BANK_SIZE        65536
 /* CBUF_BANKS is SoC-specific:
  *   RK3588: 12 banks (384 KiB CBUF)
  *   RK3568:  8 banks (256 KiB CBUF) — per RK3568 TRM Part2 section 9.1
