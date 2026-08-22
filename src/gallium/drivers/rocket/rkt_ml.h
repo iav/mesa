@@ -91,6 +91,8 @@ struct split_task {
 
 struct rkt_operation {
    struct pipe_resource *regcmd;
+   /* PC task-DMA descriptor array (RK3568 vendor 40-byte layout). */
+   struct pipe_resource *task_descs;
    struct pipe_resource *weights;
    struct pipe_resource *biases;
 

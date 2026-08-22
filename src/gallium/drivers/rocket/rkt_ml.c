@@ -105,7 +105,7 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
 
       unsigned size =
          util_dynarray_num_elements(&regcfgs[i], uint64_t) * sizeof(uint64_t);
-      regcfg_total_size += align(size, 64);
+      regcfg_total_size += align(size, 128);
    }
 
    operation->regcmd = pipe_buffer_create(pcontext->screen, 0,
@@ -129,13 +129,15 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
             util_dynarray_element(&regcfgs[i], uint64_t, reg_count - 3);
 
          uint64_t addr = rkt_resource(operation->regcmd)->phys_addr +
-                         regcmd_offset + align(size * sizeof(uint64_t), 64);
+                         regcmd_offset + align(size * sizeof(uint64_t), 128);
          *next_address_reg |= addr << 16;
 
+         /* RK3568: pc_data_amount_scale = 1 -- the next stream's
+          * PC_REGISTER_AMOUNTS is simply its word count minus one (the
+          * vendor writes amount+3 with amount = words-4; same value).
+          * The /2 below was RK3588 (scale = 2). */
          unsigned regs_to_fetch =
-            util_dynarray_num_elements(&regcfgs[i + 1], uint64_t);
-         regs_to_fetch -= 4;
-         regs_to_fetch = align(regs_to_fetch / 2, 2);
+            util_dynarray_num_elements(&regcfgs[i + 1], uint64_t) - 1;
          *reg_count_reg |= regs_to_fetch << 16;
       }
 
@@ -151,7 +153,7 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
          rkt_dump_buffer(regcmd, "regcmd", 0, i, regcmd_offset,
                          (size + 4) * sizeof(uint64_t));
 
-      regcmd_offset += align(size * sizeof(uint64_t), 64);
+      regcmd_offset += align(size * sizeof(uint64_t), 128);
    }
 
    pipe_buffer_unmap(pcontext, transfer);
@@ -293,7 +295,7 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
          unsigned kernels = weight_tensor->dims[0];
          unsigned wbytes = kernels * weight_tensor->dims[1] *
                            weight_tensor->dims[2] * weight_tensor->dims[3];
-         if (wbytes > 7 * CBUF_BANK_SIZE && !getenv("RKT_BIG_FC"))
+         if (wbytes > 7 * CBUF_BANK_SIZE && getenv("RKT_NO_FC"))
             supported = false;
       }
 
@@ -545,6 +547,42 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          job.out_bo_handle_count = 1;
          job.tasks = (uint64_t)tasks;
          job.task_count = task_count;
+
+         /* RK3568 PC task-DMA mode (vendor rknpu_job): build the 40-byte
+          * descriptor array so the PC unit walks the whole chain itself --
+          * no CPU stepping between tasks, no ping-pong config races. */
+         if (!getenv("RKT_NO_DESC") && task_count > 0) {
+            struct pc_task_desc {
+               uint32_t flags, op_idx, enable_mask, int_mask, int_clear,
+                        int_status, regcfg_amount, regcfg_offset;
+               uint64_t regcmd_addr;
+            } __attribute__((packed));
+            struct pipe_resource *descs_rsc = pipe_buffer_create(
+               pcontext->screen, 0, PIPE_USAGE_DEFAULT,
+               task_count * sizeof(struct pc_task_desc));
+            struct pipe_transfer *xfer = NULL;
+            struct pc_task_desc *d =
+               pipe_buffer_map(pcontext, descs_rsc, PIPE_MAP_WRITE, &xfer);
+            unsigned ti = 0;
+
+            util_dynarray_foreach (&operation->tasks, struct split_task, t) {
+               d[ti].flags = 0;
+               d[ti].op_idx = ti + 1;
+               d[ti].enable_mask = 0x1f;
+               d[ti].int_mask = 0x300;
+               d[ti].int_clear = 0x1ffff;
+               d[ti].int_status = 0;
+               d[ti].regcfg_amount = t->regcfg_amount - 1 +
+                  (getenv("RKT_DESC_AM") ? atoi(getenv("RKT_DESC_AM")) : 0);
+               d[ti].regcfg_offset = 0;
+               d[ti].regcmd_addr = t->regcfg_addr;
+               ti++;
+            }
+            pipe_buffer_unmap(pcontext, xfer);
+            job.task_desc_addr = rkt_resource(descs_rsc)->phys_addr;
+            operation->task_descs = descs_rsc;
+         }
+
          util_dynarray_append(&jobs, job);
       } else {
          /* Spread tasks among cores, for parallelism */
@@ -654,6 +692,7 @@ free_operation(struct rkt_operation *operation)
 {
    util_dynarray_fini(&operation->tasks);
    pipe_resource_reference(&operation->regcmd, NULL);
+   pipe_resource_reference(&operation->task_descs, NULL);
    pipe_resource_reference(&operation->weights, NULL);
    pipe_resource_reference(&operation->biases, NULL);
 }

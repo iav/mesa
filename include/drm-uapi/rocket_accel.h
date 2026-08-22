@@ -114,6 +114,15 @@ struct drm_rocket_job {
 
 	/** Input: Number of output BO handles passed in (size is that times 4). */
 	__u32 out_bo_handle_count;
+
+	/**
+	 * @task_desc_addr: Input: Optional NPU DMA address of an array of
+	 * task descriptors (40 bytes each, vendor PC task-DMA layout).  When
+	 * non-zero the kernel programs the whole task chain in one submit and
+	 * the PC unit walks the descriptors itself.  Zero selects the legacy
+	 * one-task-at-a-time stepping.
+	 */
+	__u64 task_desc_addr;
 };
 
 /**

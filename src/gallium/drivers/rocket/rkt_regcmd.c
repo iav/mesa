@@ -94,12 +94,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
                               CORE_S_POINTER_EXECUTER_PP_EN(1) |
                               CORE_S_POINTER_POINTER_PP_EN(1));
 
-   /* 2026-05-27: Move DPU + DPU_RDMA S_POINTER wakes here, BEFORE CNA
-    * configs (CBUF_CON0, DCOMP, CONV_CON1). BSP YOLOv5s/MobileNetV1 emit
-    * all 5 sub-unit S_POINTER wakes CONTIGUOUSLY at slots 0-4, then
-    * starts CNA configs. Mesa's previous order interleaved DPU wakes
-    * between CNA configs, possibly causing CNA to reject PC broadcasts
-    * (wakes not done for all sub-units). Match BSP order. */
+   /* Vendor slot order (probe-D2/mobilenet_v1 streams): CNA S_PTR, CMAC
+    * S_PTR, CORE S_PTR, then CBUF_CON0, THEN the DPU/DPU_RDMA wakes. */
+   EMIT(REG_CNA_CBUF_CON0, con0);
+
    EMIT(REG_DPU_S_POINTER, DPU_S_POINTER_POINTER_PP_MODE(1) |
                               DPU_S_POINTER_EXECUTER_PP_EN(1) |
                               DPU_S_POINTER_POINTER_PP_EN(1));
@@ -315,6 +313,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       emit_raw(regs, CNA | 0x1, 0x1134, 0);          /* DCOMP_AMOUNT1 */
       emit_raw(regs, CNA | 0x1, 0x1138, 0);          /* DCOMP_AMOUNT2 */
       emit_raw(regs, CNA | 0x1, 0x113c, 0);          /* DCOMP_AMOUNT3 */
+   if (getenv("RKT_STRICT")) {
+      unsigned r;
+      for (r = 0x1210; r <= 0x1230; r += 4)
+         emit_raw(regs, CNA | 0x1, r, 0);
+   }
       emit_raw(regs, CNA | 0x1, 0x1140, 0);          /* DCOMP_AMOUNT4 */
       emit_raw(regs, CNA | 0x1, 0x1144, 0);          /* DCOMP_AMOUNT5 */
       emit_raw(regs, CNA | 0x1, 0x1148, 0);          /* DCOMP_AMOUNT6 */
