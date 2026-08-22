@@ -452,13 +452,16 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                }
             }
          } else {
+            /* RK3568 feature layout (verified against the live vendor
+             * capture, probe-D2 impulses 2026-08-22): 8 bytes per pixel
+             * carrying 8 channels, planar 8-channel surfaces of stride
+             * W*H*8; all CNA/DPU strides are in 8-byte units. */
             unsigned n = 0;
-            for (int u = 0; u < DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE);
-                 u++) {
+            for (int u = 0; u < DIV_ROUND_UP(input_channels, 8); u++) {
                for (int x = 0; x < input_width; x++) {
                   for (int y = 0; y < input_height; y++) {
-                     for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
-                        unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
+                     for (int c = 0; c < 8; c++) {
+                        unsigned input_channel = c + u * 8;
                         if (input_channel < input_channels)
                            map[n++] = input_in[x][y][input_channel] - 0x80;
                         else
@@ -575,8 +578,13 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          rkt_get_tensor(subgraph, output_idxs[i]);
       struct pipe_transfer *transfer = NULL;
       uint8_t *raw_output;
+      /* RK3568 DPU output layout (RE 2026-08-22, layer-c28 quadrant map):
+       * surfaces of 8 channels, 8 bytes per pixel, surface stride
+       * Wout * Hout * 8 -- matches the vendor DST_SURF_STRIDE (0x1880 =
+       * 28*28*8 for the 28x28 probe).  The previous 16-channel unpack only
+       * looked correct on channel-uniform fills. */
       uint8_t(*output_in)[operation->output_height][operation->output_width]
-                         [FEATURE_ATOMIC_SIZE];
+                         [8];
       uint8_t(*output_out)[operation->output_width][operation->output_channels];
 
       DBG("Before pipe_buffer_map\n");
@@ -592,12 +600,19 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
       if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
          rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
 
-      for (int oc = 0; oc < operation->output_channels; oc++) {
-         for (int x = 0; x < operation->output_width; x++) {
-            for (int y = 0; y < operation->output_height; y++) {
-               unsigned c = oc % FEATURE_ATOMIC_SIZE;
-               unsigned g = oc / FEATURE_ATOMIC_SIZE;
-               output_out[y][x][oc] = output_in[g][y][x][c] + 0x80;
+      {
+         /* Same planar 8-channel / 8-byte-pixel layout as the input side
+          * (verified against the live vendor capture 2026-08-22). */
+         uint8_t *raw = (uint8_t *)output_in;
+         unsigned rows = operation->output_width;   /* dims[1] */
+         unsigned cols = operation->output_height;  /* dims[2] */
+         for (int oc = 0; oc < operation->output_channels; oc++) {
+            unsigned g = oc / 8, c = oc % 8;
+            for (unsigned y = 0; y < rows; y++) {
+               for (unsigned x = 0; x < cols; x++) {
+                  output_out[y][x][oc] =
+                     raw[g * rows * cols * 8 + (y * cols + x) * 8 + c] + 0x80;
+               }
             }
          }
       }

@@ -9,10 +9,12 @@
 static unsigned
 calc_entries_per_slice(struct rkt_operation *operation)
 {
-   unsigned bpe = sizeof(uint8_t);
-   unsigned atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
-   unsigned total_c_atomics =
-      DIV_ROUND_UP(operation->input_channels * bpe, FEATURE_ATOMIC_SIZE);
+   /* RK3568 (RE 2026-08-22): the feature atomic is 8 channels (8 bytes) and a
+    * CBUF entry is 32 bytes (4 atomics) -- half the RK3588 sizes.  Verified
+    * against all 51 mobilenet_v1 vendor tasks: entries = W * ceil(C/8) / 4
+    * reproduces every DATA_ENTRIES value (C = 8..512, W = 7..224). */
+   unsigned atomics_per_entry = 4;
+   unsigned total_c_atomics = DIV_ROUND_UP(operation->input_channels, 8);
    unsigned last_c_atomics = total_c_atomics % atomics_per_entry;
    unsigned int_c_entries =
       (total_c_atomics / atomics_per_entry) * operation->input_width;
@@ -138,13 +140,11 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    if (task->input_channels_real == 1)
       task->input_data_entries = task->input_width * task->input_height;
-   else if (task->input_width == 40 && task->input_channels_real == 40)
-      task->input_data_entries = 40;
    else
+      /* RK3568: entries = W * ceil(C/8) / 4 (8-ch atomics, 32-byte entries);
+       * matches the vendor stream for every mobilenet_v1 task. */
       task->input_data_entries = DIV_ROUND_UP(
-         task->input_width * 2 *
-            DIV_ROUND_UP(task->input_channels_real, FEATURE_ATOMIC_SIZE),
-         8);
+         task->input_width * DIV_ROUND_UP(task->input_channels, 8), 4);
 
    task->weights_width = operation->weights_width;
    task->weights_height = operation->weights_height;
@@ -345,10 +345,13 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
             cur_task->input_height = consumed;
       }
 
+      /* RK3568: planar 8-channel surfaces, 8 bytes per pixel -- a band
+       * offset is rows * W * 8 (the per-surface stride register covers the
+       * upper channel groups). */
       cur_task->input_offset =
-         calc_line_stride(operation->input_width) * cur_task->top_slice;
+         operation->input_width * 8 * cur_task->top_slice;
       cur_task->output_offset =
-         calc_line_stride(operation->output_width) * output_height_processed;
+         operation->output_width * 8 * output_height_processed;
 
       cur_task->input_banks = available_input_banks;
       cur_task->weights_banks = available_weights_banks;

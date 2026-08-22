@@ -5,6 +5,7 @@
 
 #include "util/u_inlines.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rkt_coefs.h"
@@ -54,6 +55,46 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
    unsigned input_channels_2 = MIN2(input_channels, input_channel_groups);
 
    unsigned n = 0;
+   if (!rkt_is_depthwise(poperation)) {
+      /* RK3568 regular-conv weight layout, solved by probe-model RE
+       * (2026-08-22, Test 43): known-weight models converted with
+       * rknn-toolkit2 for rk3568 carry the packed buffer in the .rknn, and
+       * marker weights give the exact byte positions:
+       *
+       *   pos(oc, ky, kx, ic) = (oc / 16) * KH*KW*16*icb
+       *                       + (ky*KW + kx) * 16*icb
+       *                       + (oc %% 16) * icb + ic,   icb = align(Cin, 16)
+       *
+       * i.e. kernel groups of SIXTEEN (not 32 as on RK3588), tap-major inside
+       * a group, 16 kernels per tap block, ic last.  Bytes are w - 0x80. */
+      /* ic dimension is cut into 32-channel slices that sit ABOVE the
+       * 16-kernel rows (verified with a Cin=64 probe model: kernel row is
+       * always at most 32 bytes). */
+      unsigned rowic = MIN2(align(input_channels_real, 16), 32);
+      unsigned slices = DIV_ROUND_UP(input_channels_real, 32);
+      unsigned kgroups = DIV_ROUND_UP(output_channels_real, 16);
+      unsigned slcblk = 16 * rowic;
+      unsigned tapblk = slices * slcblk;
+      unsigned grpblk = weights_width * weights_height * tapblk;
+
+      memset(weights_out, zero_point - 0x80, weights_size);
+      for (unsigned oc = 0; oc < output_channels_real; oc++) {
+         for (unsigned ky = 0; ky < weights_width; ky++) {
+            for (unsigned kx = 0; kx < weights_height; kx++) {
+               for (unsigned ic = 0; ic < input_channels_real; ic++) {
+                  unsigned pos = (oc / 16) * grpblk +
+                                 (ky * weights_height + kx) * tapblk +
+                                 (ic / 32) * slcblk +
+                                 (oc % 16) * rowic + (ic % 32);
+                  weights_out[pos] = weights_in[oc][ky][kx][ic] - 0x80;
+               }
+            }
+         }
+      }
+      n = kgroups * grpblk;
+      assert(n <= weights_size);
+      goto packed;
+   }
    /* TEST (iav RE 2026-08-22): RKT_WLAY=1 — candidate RK3568 layout
     * [kernel group of 16][tap y*3+x][oc2 0..15][ic]. */
    if (getenv("RKT_WLAY") && atoi(getenv("RKT_WLAY")) == 2) {
@@ -118,6 +159,10 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
    }
 
 packed:
+   if (getenv("RKT_WDUMP")) {
+      FILE *f = fopen(getenv("RKT_WDUMP"), "wb");
+      if (f) { fwrite(weights_out, 1, weights_size, f); fclose(f); }
+   }
    /* TEST (iav RE 2026-08-22): RKT_WPOKE=<byte offset> — обнулить всю
     * упаковку и поставить один байт 127: выход покажет, какой (oc,tap,ic)
     * этот байт кормит. */
@@ -197,6 +242,7 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
     *          whole conv_scale lives in OUT_CVT_SCALE/SHIFT as the vendor does.
     * Stream length follows the padded channel count the RDMA fetches. */
    unsigned padded_channels = align(output_channels, 32);
+   bool bias_only_stream = true; /* per-tensor scheme (vendor probe-D2) */
    unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
    uint8_t *stream;
 
@@ -207,6 +253,16 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
    stream = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
    biases = (uint32_t *)stream;
 
+   if (bias_only_stream) {
+      int32_t *b32 = (int32_t *)stream;
+      for (unsigned oc = 0; oc < padded_channels; oc++) {
+         if (oc >= output_channels) { b32[oc] = 0; continue; }
+         int32_t corr =
+            calculate_bias_correction(subgraph, poperation, oc, weights);
+         b32[oc] = biases_in[oc] - corr;
+      }
+      goto stream_done;
+   }
    for (unsigned g = 0; g < padded_channels / 4; g++) {
       int32_t *bias32 = (int32_t *)(stream + g * 32);
       int16_t *ow16 = (int16_t *)(stream + g * 32 + 16);
@@ -229,6 +285,8 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
          /* hardware ADDS ow*sum(x): ow = 0x80 - wzp (Test 42) */
          ow16[j] = 0x80 - weight_zero_point;
          mul16[j] = 1 << 14;
+         if (getenv("RKT_MULSH"))
+            mul16[j] = 1 << (14 - atoi(getenv("RKT_MULSH")));
          if (getenv("RKT_WPOKE")) {
             bias32[j] = 0; ow16[j] = 0; mul16[j] = 1 << 14;
          }
@@ -250,6 +308,7 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
       }
    }
 
+stream_done:
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
       static int task = 0;
       rkt_dump_buffer((uint8_t *)biases, "biases", 0, task++, 0,

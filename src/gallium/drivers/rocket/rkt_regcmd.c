@@ -168,7 +168,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
     * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
    emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
-            (task->input_width << 16) | task->input_data_entries);
+            (task->input_width << 16) |
+               (getenv("RKT_ENTV")
+                   ? task->input_width * task->input_channels / 32
+                   : task->input_data_entries));
 
    if (task->input_channels_real == 1) {
       unsigned truncate = 14;
@@ -333,7 +336,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
    /* RK3568 vendor requant (RE 2026-08-22): 0xe0 = BS_MUL_SHIFT_VALUE_NEG=14,
     * pairs with the shift-14 multiplier stage in BS_MUL_CFG below. */
-   EMIT(REG_DPU_DATA_FORMAT, getenv("RKT_DF0") ? 0 : 0xe0);
+   EMIT(REG_DPU_DATA_FORMAT, 0);
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -356,29 +359,30 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * zero point all come per channel from the BRDMA coefficient stream (see
     * rkt_fill_biases).  0x148: BS_ALU_SRC=1 (bias from stream), relu bypass,
     * multiplier stage active.  0xe01: multiplier from stream, shift 14. */
-   EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x148);
+   EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x158);
    EMIT(REG_DPU_BS_ALU_CFG, 0);
-   EMIT(REG_DPU_BS_MUL_CFG, 0xe01);
+   EMIT(REG_DPU_BS_MUL_CFG, 0);
    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
 
    if (operation->depthwise) {
       EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3) |
                                  DPU_BS_OW_CFG_SIZE_E_1(3) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(3) | 1); /* OW_SRC: stream */
+                                 DPU_BS_OW_CFG_SIZE_E_0(3));
    } else {
       EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(1) |
                                  DPU_BS_OW_CFG_SIZE_E_1(1) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(1) | 1); /* OW_SRC: stream */
+                                 DPU_BS_OW_CFG_SIZE_E_0(1));
    }
 
-   /* Weight zero point compensation moved into the per-channel stream. */
-   EMIT(REG_DPU_BS_OW_OP, 0);
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
 
-   EMIT(REG_DPU_WDMA_SIZE_0,
-        DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
-   EMIT(REG_DPU_WDMA_SIZE_1,
-        DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
-           DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
+   if (!getenv("RKT_NOWDMA")) {
+      EMIT(REG_DPU_WDMA_SIZE_0,
+           DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
+      EMIT(REG_DPU_WDMA_SIZE_1,
+           DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
+              DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
+   }
    EMIT(REG_DPU_BN_CFG,
         DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
            DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
@@ -536,6 +540,8 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       if (scale < 1 << 14)
          scale |= 1 << 14;
 
+      if (getenv("RKT_MULSH"))
+         shift -= atoi(getenv("RKT_MULSH"));
       EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(scale));
       EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(shift - 1));
    }
@@ -577,7 +583,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
    }
 
-   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(7));
+   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr);
    /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
@@ -586,7 +592,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * of mobilenet_v1 (10 distinct values, all matching).  Without it the bias
     * RDMA has nothing to fetch, which matches our DT_RD being exactly 512
     * bytes (one bias buffer) short of the vendor's. */
-   emit_raw(regs, DPU_RDMA | 0x1, 0x5024, task->output_channels - 1);
+   emit_raw(regs, DPU_RDMA | 0x1, 0x5024, task->output_channels * 4 / 8 - 1);
    EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 1); /* bit0 = disable, as vendor */
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
 
@@ -621,8 +627,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * three-operand BRDMA stream (DATA_USE=7) the old BURST_LEN=15 |
        * MRDMA_DISABLE combination scrambles which stream halfword lands in
        * which BS operand lane. */
-      rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
-                            DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
+      if (getenv("RKT_FEAT4000"))
+         rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(8);
+      else
+         rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
+                               DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
    }
 
    if (operation->depthwise)
