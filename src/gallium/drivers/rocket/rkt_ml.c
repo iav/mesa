@@ -293,7 +293,7 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
          unsigned kernels = weight_tensor->dims[0];
          unsigned wbytes = kernels * weight_tensor->dims[1] *
                            weight_tensor->dims[2] * weight_tensor->dims[3];
-         if (wbytes > 7 * CBUF_BANK_SIZE)
+         if (wbytes > 7 * CBUF_BANK_SIZE && !getenv("RKT_BIG_FC"))
             supported = false;
       }
 

@@ -102,6 +102,10 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    task->output_channels_real = operation->output_channels;
    task->output_channels = align(MAX2(operation->output_channels, 32), 32);
+   /* FC-shaped convolution (1x1 spatial input): the vendor aligns the
+    * output channels to 16, not 32 (mobilenet_v1 t50: 1001 -> 1008). */
+   if (operation->input_width == 1 && operation->input_height == 1)
+      task->output_channels = align(MAX2(operation->output_channels, 16), 16);
    if (operation->depthwise && operation->input_channels > 32) {
       task->output_channels_real = 32;
       task->output_channels = 32;
@@ -181,6 +185,9 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    if (operation->depthwise)
       task->weights_kernels = 1;
+   else if (operation->input_width == 1 && operation->input_height == 1)
+      /* FC-shaped: the vendor keeps the exact kernel count (1001). */
+      task->weights_kernels = operation->output_channels;
    else
       task->weights_kernels = align(operation->output_channels, 2);
 

@@ -136,9 +136,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * 51 tasks of mobilenet_v1, including layers with 512 and 1001 kernels.
     * Mesa's kernels/32 - 1 underflows to 0xff on depthwise, where kernels is
     * 1 -- and depthwise is exactly what stalls after CNA. */
+   /* FC-shaped (1x1 spatial input): the vendor uses FEATURE_GRAINS=1. */
    EMIT(REG_CNA_CONV_CON2,
         CNA_CONV_CON2_FEATURE_GRAINS(
-           task->stride_y + task->weights_height));
+           (task->input_width == 1 && task->input_height == 1)
+              ? 1
+              : task->stride_y + task->weights_height));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
    /* CONV_CON4: RGB_BYTELENGTH per TRM (page 418). Required to be non-zero
@@ -273,12 +276,21 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_CNA_DMA_CON1, CNA_DMA_CON1_LINE_STRIDE(task->input_line_stride));
    EMIT(REG_CNA_DMA_CON2, CNA_DMA_CON2_SURF_STRIDE(task->input_surface_stride));
 
-   EMIT(REG_CNA_FC_DATA_SIZE0,
-        CNA_FC_DATA_SIZE0_DMA_WIDTH(operation->input_width) |
-           CNA_FC_DATA_SIZE0_DMA_HEIGHT(task->input_height));
+   if (task->input_width == 1 && task->input_height == 1) {
+      /* FC-shaped: the CNA DMA reads the 1x1xC input as (C/8) x 1 x 8
+       * (vendor t50: 128 x 1, channel 8 for C=1024). */
+      EMIT(REG_CNA_FC_DATA_SIZE0,
+           CNA_FC_DATA_SIZE0_DMA_WIDTH(task->input_channels / 8) |
+              CNA_FC_DATA_SIZE0_DMA_HEIGHT(1));
+      EMIT(REG_CNA_FC_DATA_SIZE1, CNA_FC_DATA_SIZE1_DMA_CHANNEL(8));
+   } else {
+      EMIT(REG_CNA_FC_DATA_SIZE0,
+           CNA_FC_DATA_SIZE0_DMA_WIDTH(operation->input_width) |
+              CNA_FC_DATA_SIZE0_DMA_HEIGHT(task->input_height));
 
-   EMIT(REG_CNA_FC_DATA_SIZE1,
-        CNA_FC_DATA_SIZE1_DMA_CHANNEL(task->input_channels));
+      EMIT(REG_CNA_FC_DATA_SIZE1,
+           CNA_FC_DATA_SIZE1_DMA_CHANNEL(task->input_channels));
+   }
    /* RK3568 DCOMP layout (per BSP regcmd capture 2026-05-22):
     *   0x1110..0x112c = DCOMP_ADDR0..7  (8 weight chunk base pointers)
     *   0x1130..0x114c = DCOMP_AMOUNT0..7 (8 weight chunk byte amounts)
@@ -366,6 +378,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       DPU_FEATURE_MODE_CFG_BURST_LEN(2) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(4);
    if (operation->depthwise)
       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
+   /* FC-shaped: single output pixel with many channels -- the DPU writes
+    * align(K,16)/8 consecutive 8-byte surfaces (vendor t50: NONALIGN with
+    * SURF_LEN 126 for 1001 kernels). */
+   if (task->input_width == 1 && task->input_height == 1)
+      feat_mode_cfg |= DPU_FEATURE_MODE_CFG_NONALIGN(1) |
+                       DPU_FEATURE_MODE_CFG_SURF_LEN(task->output_channels / 8);
 
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
    /* RK3568 vendor requant (RE 2026-08-22): 0xe0 = BS_MUL_SHIFT_VALUE_NEG=14,
@@ -382,7 +400,8 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * tasks of mobilenet_v1 (checked against the full output tensor, not the
     * per-task band).  DPU_SURFACE_ADD at 0x40c0 keeps the undivided value. */
    EMIT(REG_DPU_DST_SURF_STRIDE,
-        DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(task->output_surface_stride / 2));
+        DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(
+           MAX2(task->output_surface_stride / 2, 1)));
    EMIT(REG_DPU_DATA_CUBE_WIDTH,
         DPU_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_DATA_CUBE_HEIGHT,

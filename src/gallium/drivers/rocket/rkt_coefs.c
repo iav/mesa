@@ -96,22 +96,38 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       unsigned slcblk = 16 * rowic;
       unsigned tapblk = slices * slcblk;
       unsigned grpblk = weights_width * weights_height * tapblk;
+      /* FC-shaped (1x1 input): the vendor stores the LAST kernel group
+       * compactly -- K%16 rows, no padding to 16 (probe-FCL byte-exact:
+       * 1001 kernels = 62 full groups + a 9-row tail, 1025024 bytes). */
+      bool fc_like = poperation->input_tensors[0]->dims[1] == 1 &&
+                     poperation->input_tensors[0]->dims[2] == 1;
+      unsigned tail_rows =
+         (fc_like && (output_channels_real % 16)) ? output_channels_real % 16
+                                                  : 16;
+      unsigned full_groups = tail_rows == 16 ? kgroups : kgroups - 1;
 
       memset(weights_out, zero_point - 0x80, weights_size);
       for (unsigned oc = 0; oc < output_channels_real; oc++) {
+         unsigned g = oc / 16;
+         unsigned rows = g < full_groups ? 16 : tail_rows;
+         unsigned gslcblk = rows * rowic;
+         unsigned gtapblk = slices * gslcblk;
          for (unsigned ky = 0; ky < weights_width; ky++) {
             for (unsigned kx = 0; kx < weights_height; kx++) {
                for (unsigned ic = 0; ic < input_channels_real; ic++) {
-                  unsigned pos = (oc / 16) * grpblk +
-                                 (ky * weights_height + kx) * tapblk +
-                                 (ic / 32) * slcblk +
+                  unsigned pos = g * grpblk +
+                                 (ky * weights_height + kx) * gtapblk +
+                                 (ic / 32) * gslcblk +
                                  (oc % 16) * rowic + (ic % 32);
                   weights_out[pos] = weights_in[oc][ky][kx][ic] - 0x80;
                }
             }
          }
       }
-      n = kgroups * grpblk;
+      n = full_groups * grpblk +
+          (tail_rows == 16
+              ? 0
+              : weights_width * weights_height * slices * tail_rows * rowic);
       assert(n <= weights_size);
       goto packed;
    }
