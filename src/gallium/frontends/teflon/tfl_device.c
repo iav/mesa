@@ -893,6 +893,13 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
          tf_context, node_index, &node, &registration));
 
       supported = check_op_support(tf_delegate, tf_context, node, registration);
+      /* TEST (iav RE): TEFLON_MAX_OPS=K delegates only the first K supported
+       * plan nodes -- layer bisection for chained-network debugging. */
+      {
+         const char *mo = getenv("TEFLON_MAX_OPS");
+         if (mo && i >= atoi(mo))
+            supported = false;
+      }
 
       teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
                    tflite_builtin_op_name(registration->builtin_code),

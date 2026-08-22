@@ -441,7 +441,19 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
           * convert to signed. The DMA unit seems to be able to convert from
           * unsigned to signed though.
           */
-         if (input_channels == 1) {
+         if (input_channels == 3) {
+            /* ARGB input: packed RGB, raw uint8 (the CNA CVT stage shifts by
+             * -128), rows aligned to 8 bytes with zero padding. */
+            unsigned line = DIV_ROUND_UP(input_height * 3, 8) * 8;
+            for (int x = 0; x < input_width; x++) {
+               unsigned n = x * line;
+               for (int y = 0; y < input_height; y++)
+                  for (int c = 0; c < 3; c++)
+                     map[n++] = input_in[x][y][c];
+               for (; n < (x + 1) * line;)
+                  map[n++] = 0;
+            }
+         } else if (input_channels == 1) {
             unsigned n = 0;
             for (int x = 0; x < input_width; x++) {
                for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
