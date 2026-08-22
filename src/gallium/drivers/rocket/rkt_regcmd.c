@@ -331,7 +331,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
 
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
-   EMIT(REG_DPU_DATA_FORMAT, 0);
+   /* RK3568 vendor requant (RE 2026-08-22): 0xe0 = BS_MUL_SHIFT_VALUE_NEG=14,
+    * pairs with the shift-14 multiplier stage in BS_MUL_CFG below. */
+   EMIT(REG_DPU_DATA_FORMAT, getenv("RKT_DF0") ? 0 : 0xe0);
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -350,24 +352,27 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_DATA_CUBE_CHANNEL,
         DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task->output_channels_real - 1) |
            DPU_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
-   EMIT(REG_DPU_BS_CFG, DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1) |
-                           DPU_BS_CFG_BS_RELU_BYPASS(1) |
-                           DPU_BS_CFG_BS_MUL_BYPASS(1));
+   /* RK3568 vendor requant (RE 2026-08-22): bias, scale multiplier and weight
+    * zero point all come per channel from the BRDMA coefficient stream (see
+    * rkt_fill_biases).  0x148: BS_ALU_SRC=1 (bias from stream), relu bypass,
+    * multiplier stage active.  0xe01: multiplier from stream, shift 14. */
+   EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x148);
    EMIT(REG_DPU_BS_ALU_CFG, 0);
-   EMIT(REG_DPU_BS_MUL_CFG, 0);
+   EMIT(REG_DPU_BS_MUL_CFG, 0xe01);
    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
 
    if (operation->depthwise) {
       EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3) |
                                  DPU_BS_OW_CFG_SIZE_E_1(3) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(3));
+                                 DPU_BS_OW_CFG_SIZE_E_0(3) | 1); /* OW_SRC: stream */
    } else {
       EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(1) |
                                  DPU_BS_OW_CFG_SIZE_E_1(1) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(1));
+                                 DPU_BS_OW_CFG_SIZE_E_0(1) | 1); /* OW_SRC: stream */
    }
 
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
+   /* Weight zero point compensation moved into the per-channel stream. */
+   EMIT(REG_DPU_BS_OW_OP, 0);
 
    EMIT(REG_DPU_WDMA_SIZE_0,
         DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
@@ -572,7 +577,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
    }
 
-   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
+   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(7));
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr);
    /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
@@ -582,7 +587,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * RDMA has nothing to fetch, which matches our DT_RD being exactly 512
     * bytes (one bias buffer) short of the vendor's. */
    emit_raw(regs, DPU_RDMA | 0x1, 0x5024, task->output_channels - 1);
-   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
+   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 1); /* bit0 = disable, as vendor */
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
 
    unsigned ew_stride =
@@ -611,6 +616,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
                             DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE(5);
    } else {
+      /* RK3568 vendor requant (RE 2026-08-22): the vendor runs every conv task
+       * with 0x4000/0x4006 here -- BURST_LEN=8, MRDMA_DISABLE clear.  With the
+       * three-operand BRDMA stream (DATA_USE=7) the old BURST_LEN=15 |
+       * MRDMA_DISABLE combination scrambles which stream halfword lands in
+       * which BS operand lane. */
       rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
                             DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
    }
@@ -658,16 +668,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TRM: before op_en, 64'h0041_xxxx_xxxx_xxxx must be set. */
    util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
 
-   /* Individual sub-unit OP_EN writes. The broadcast target=0x81 is
-    * RK3588-specific and not supported on RK3568. Direct writes work on both. */
-   emit_raw(regs, CNA | 0x1, REG_CNA_OPERATION_ENABLE,
-            CNA_OPERATION_ENABLE_OP_EN(1));
-   emit_raw(regs, CORE | 0x1, REG_CORE_OPERATION_ENABLE,
-            CORE_OPERATION_ENABLE_OP_EN(1));
-   emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_OPERATION_ENABLE,
-            DPU_RDMA_RDMA_OPERATION_ENABLE_OP_EN(1));
-   emit_raw(regs, DPU | 0x1, REG_DPU_OPERATION_ENABLE,
-            DPU_OPERATION_ENABLE_OP_EN(1));
+   /* RK3568 replay bisection (RE 2026-08-22, Test 42): the five units MUST
+    * be started atomically with the vendor broadcast write (target 0x81,
+    * reg 8, 0x1f) -- starting them one at a time desynchronizes the
+    * pipeline and scrambles which BRDMA stream halfword lands in which BS
+    * operand lane (41%% of the output bytes of a known-good vendor task go
+    * wrong with sequential OP_EN writes, byte-exact with the broadcast). */
+   util_dynarray_append_typed(regs, uint64_t, 0x00810000001f0008);
 }
 
 void
