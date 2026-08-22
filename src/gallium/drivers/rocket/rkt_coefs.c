@@ -5,6 +5,8 @@
 
 #include "util/u_inlines.h"
 
+#include <stdlib.h>
+#include <string.h>
 #include "rkt_coefs.h"
 #include "rkt_ml.h"
 
@@ -29,6 +31,9 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
 
    input_channels = MAX2(input_channels, FEATURE_ATOMIC_SIZE);
 
+   /* TEST (iav RE 2026-08-22): RK3568 half-width weight atomic experiment */
+   unsigned watom = getenv("RKT_WK") ? atoi(getenv("RKT_WK")) : WEIGHT_ATOMIC_SIZE;
+
    output_channels = align(output_channels, 2);
    if (rkt_is_depthwise(poperation))
       output_channels = 1;
@@ -40,7 +45,7 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT, weights_size);
    weights_out = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
 
-   unsigned input_channel_groups = WEIGHT_ATOMIC_SIZE;
+   unsigned input_channel_groups = watom;
    if (rkt_is_depthwise(poperation))
       input_channel_groups *= 2;
 
@@ -49,15 +54,46 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
    unsigned input_channels_2 = MIN2(input_channels, input_channel_groups);
 
    unsigned n = 0;
-   for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, WEIGHT_ATOMIC_SIZE);
+   /* TEST (iav RE 2026-08-22): RKT_WLAY=1 — candidate RK3568 layout
+    * [kernel group of 16][tap y*3+x][oc2 0..15][ic]. */
+   if (getenv("RKT_WLAY") && atoi(getenv("RKT_WLAY")) == 2) {
+      /* плоская укладка [oc][ty][tx][ic] для картирования */
+      for (int oc = 0; oc < output_channels; oc++)
+         for (int y = 0; y < weights_height; y++)
+            for (int x = 0; x < weights_width; x++)
+               for (int ic = 0; ic < input_channels; ic++)
+                  weights_out[n++] =
+                     (oc < output_channels_real && ic < input_channels_real)
+                        ? weights_in[oc][x][y][ic] - 0x80 : 0;
+      goto packed;
+   }
+   if (getenv("RKT_WLAY")) {
+      for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, 16); oc1++) {
+         for (int y = 0; y < weights_height; y++) {
+            for (int x = 0; x < weights_width; x++) {
+               for (int oc2 = 0; oc2 < 16; oc2++) {
+                  for (int ic = 0; ic < input_channels; ic++) {
+                     unsigned oc = oc1 * 16 + oc2;
+                     if (oc >= output_channels_real || ic >= input_channels_real)
+                        weights_out[n++] = 0;
+                     else
+                        weights_out[n++] = weights_in[oc][x][y][ic] - 0x80;
+                  }
+               }
+            }
+         }
+      }
+      goto packed;
+   }
+   for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, watom);
         oc1++) {
       for (int ic1 = 0; ic1 < input_channels_1; ic1++) {
          for (int x = 0; x < weights_width; x++) {
             for (int y = 0; y < weights_height; y++) {
-               for (int oc2 = 0; oc2 < MIN2(output_channels, WEIGHT_ATOMIC_SIZE);
+               for (int oc2 = 0; oc2 < MIN2(output_channels, watom);
                     oc2++) {
                   for (int ic2 = 0; ic2 < input_channels_2; ic2++) {
-                     unsigned oc = oc1 * WEIGHT_ATOMIC_SIZE + oc2;
+                     unsigned oc = oc1 * watom + oc2;
                      unsigned ic = ic1 * input_channel_groups + ic2;
                      if (output_channels_real > 2 &&
                          oc >= align(output_channels_real, 2))
@@ -79,6 +115,17 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
             }
          }
       }
+   }
+
+packed:
+   /* TEST (iav RE 2026-08-22): RKT_WPOKE=<byte offset> — обнулить всю
+    * упаковку и поставить один байт 127: выход покажет, какой (oc,tap,ic)
+    * этот байт кормит. */
+   if (getenv("RKT_WPOKE")) {
+      unsigned off = strtoul(getenv("RKT_WPOKE"), NULL, 0);
+      memset(weights_out, 0, weights_size);
+      if (off < weights_size)
+         weights_out[off] = 127;
    }
 
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
@@ -139,74 +186,74 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
    struct pipe_resource *rsc;
    uint32_t *biases;
 
+   /* RK3568 vendor requant (RE 2026-08-22): the DPU BS stage takes all three
+    * per-channel operands from the BRDMA stream, 8 bytes per channel packed in
+    * groups of four channels: [bias int32 x4][ow int16 x4][mul uint16 x4].
+    *   bias = quantized bias minus the input-zero-point correction (acc domain)
+    *   ow   = weight_zero_point - 0x80 (weights are stored as w - 0x80;
+    *          hardware computes acc - ow * sum(x))
+    *   mul  = per-channel scale multiplier, shift fixed at 14 (BS_MUL_CFG);
+    *          with per-tensor quantization this is exactly 1 << 14, and the
+    *          whole conv_scale lives in OUT_CVT_SCALE/SHIFT as the vendor does.
+    * Stream length follows the padded channel count the RDMA fetches. */
+   unsigned padded_channels = align(output_channels, 32);
+   unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
+   uint8_t *stream;
+
+   *truncate_bits = 0;
+
    rsc = pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT,
-                            output_channels * sizeof(uint32_t));
-   biases = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
+                            padded_channels * 8);
+   stream = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
+   biases = (uint32_t *)stream;
 
-   // DBG("weight_scale %x\n",
-   // fui(poperation->conv.weight_tensor->scale));
-   /* TODO: Figure out when exactly we need to truncate */
-   /* From
-    * http://nvdla.org/hw/v1/ias/unit_description.html#convolution-accumulator :
-    *
-    * The final result of accumulator in CACC is 48bits for INT16 and 34bits for
-    * INT8. The bit width between CACC and SDP is 32. For precisions INT8 and
-    * INT16, there is a round and saturation operation before sending the result
-    * to SDP. The precision of rounding is configured by field CLIP_TRUNCATE in
-    * register D_CLIP_CFG. For FP16, the value is just converted from FP48 to
-    * FP32.
-    */
-   if (fui(poperation->conv.weight_tensor->scale) == 0x3a88323f ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c0060de ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c06022d ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c1642e3 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c1e3f51 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c5c8aa8 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c615e93 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c7326a2 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3c783013 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3d1748e6 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3d282992 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3d2e87ae ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3d77f5f6 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3a9a5956 ||
-       fui(poperation->conv.weight_tensor->scale) == 0x3caebc56)
-      *truncate_bits = 1;
-   else
-      *truncate_bits = 0;
+   for (unsigned g = 0; g < padded_channels / 4; g++) {
+      int32_t *bias32 = (int32_t *)(stream + g * 32);
+      int16_t *ow16 = (int16_t *)(stream + g * 32 + 16);
+      uint16_t *mul16 = (uint16_t *)(stream + g * 32 + 24);
 
-   int32_t max_bias = 0;
-   int32_t max_corr = 0;
-   unsigned max_num_bits = 0;
-   bool retry = true;
-   while (retry) {
-      for (int oc = 0; oc < output_channels; oc++) {
+      for (unsigned j = 0; j < 4; j++) {
+         unsigned oc = g * 4 + j;
+
+         if (oc >= output_channels) {
+            bias32[j] = 0;
+            ow16[j] = 0;
+            mul16[j] = 1 << 14;
+         ow16[j] = 0; /* PROBE4 */
+            continue;
+         }
+
          int32_t corr =
             calculate_bias_correction(subgraph, poperation, oc, weights);
-         biases[oc] = (biases_in[oc] - corr) / (1 << *truncate_bits);
-
-         int64_t max_val =
-            (biases_in[oc] - corr + 255 * 255 * weights_size * weights_size) /
-            (1 << *truncate_bits);
-         unsigned num_bits = ceil(log(abs((int32_t)max_val)) / log(2)) + 1;
-         max_bias = MAX2(max_bias, biases[oc]);
-         max_corr = MAX2(max_corr, corr);
-         max_num_bits = MAX2(max_num_bits, num_bits);
-
-         /* TODO: This doesn't actually work, num_bits doesn't go above 19, and the
-          * blob sometimes truncates way below */
-         if (num_bits > 32) {
-            (*truncate_bits)++;
-            retry = true;
-         } else
-            retry = false;
+         bias32[j] = biases_in[oc] - corr;
+         /* hardware ADDS ow*sum(x): ow = 0x80 - wzp (Test 42) */
+         ow16[j] = 0x80 - weight_zero_point;
+         mul16[j] = 1 << 14;
+         if (getenv("RKT_WPOKE")) {
+            bias32[j] = 0; ow16[j] = 0; mul16[j] = 1 << 14;
+         }
+         /* TEST probes: RKT_PROBE selects synthetic stream contents */
+         if (getenv("RKT_PROBE")) {
+            int pr = atoi(getenv("RKT_PROBE"));
+            uint16_t *slots = (uint16_t *)(stream + g * 32);
+            unsigned k;
+            switch (pr) {
+            case 1: /* staircase bias, ow 0, mul 1<<14 */
+               bias32[j] = (oc + 1) * 2048; ow16[j] = 0; mul16[j] = 1 << 14;
+               break;
+            case 5: /* globally unique small u16 in every slot */
+               for (k = 0; k < 16; k++)
+                  slots[k] = 4 * (g * 16 + k + 1);
+               break;
+            }
+         }
       }
    }
 
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
       static int task = 0;
       rkt_dump_buffer((uint8_t *)biases, "biases", 0, task++, 0,
-                      output_channels * sizeof(uint32_t));
+                      padded_channels * 8);
    }
 
    pipe_buffer_unmap(pcontext, transfer_out);
