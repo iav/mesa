@@ -70,7 +70,11 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       /* ic dimension is cut into 32-channel slices that sit ABOVE the
        * 16-kernel rows (verified with a Cin=64 probe model: kernel row is
        * always at most 32 bytes). */
-      unsigned rowic = MIN2(align(input_channels_real, 16), 32);
+      /* ARGB / few-channel input (Cin<=8, probe-RGB byte-exact): the kernel
+       * row is 8 bytes -- ic then zero padding to 8. */
+      unsigned rowic = input_channels_real <= 8
+                          ? 8
+                          : MIN2(align(input_channels_real, 16), 32);
       unsigned slices = DIV_ROUND_UP(input_channels_real, 32);
       unsigned kgroups = DIV_ROUND_UP(output_channels_real, 16);
       unsigned slcblk = 16 * rowic;

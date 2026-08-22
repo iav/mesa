@@ -78,8 +78,10 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    task->input_height = operation->input_height;
    task->input_channels =
-      align(MAX2(operation->input_channels, FEATURE_ATOMIC_SIZE),
-            FEATURE_ATOMIC_SIZE);
+      operation->input_channels == 3
+         ? 8
+         : align(MAX2(operation->input_channels, FEATURE_ATOMIC_SIZE),
+                 FEATURE_ATOMIC_SIZE);
    task->input_channels_real = operation->input_channels;
    task->input_zero_point = operation->input_zero_point;
    task->input_scale = operation->input_scale;
@@ -118,10 +120,16 @@ fill_task(struct rkt_ml_subgraph *subgraph,
       } else
          task->input_surface_stride =
             (float)task->input_line_stride * (((float)task->input_height) - 1);
+   } else if (operation->input_channels == 3) {
+      /* ARGB input: packed RGB rows aligned to 8 bytes; strides are in
+       * 8-byte units (vendor probe-RGB: W=28 -> line 11, surf 784). */
+      task->input_line_stride =
+         DIV_ROUND_UP(operation->input_width * 3, 8);
+      task->input_surface_stride =
+         operation->input_width * operation->input_height;
    } else {
-      /* RK3568 (vendor librknnrt 1.5.2, RE 2026-08-20): both CNA DMA strides
-       * are in 16-byte cells: line_stride = Win, surf_stride = Win * Hin.
-       * The old /4 and (Hin/4 - 1) were RK3588-era magic. */
+      /* RK3568: strides are in 8-byte units; the numbers coincide with the
+       * old 16-byte-cell reading (W and W*H) for the feature layout. */
       task->input_line_stride =
          calc_line_stride(operation->input_width) / FEATURE_ATOMIC_SIZE;
       task->input_surface_stride =
@@ -140,6 +148,11 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    if (task->input_channels_real == 1)
       task->input_data_entries = task->input_width * task->input_height;
+   else if (task->input_channels_real == 3)
+      /* ARGB: entries = ceil(W*8/32) rounded up to even (vendor: 28->8,
+       * 224->56). */
+      task->input_data_entries =
+         align(DIV_ROUND_UP(task->input_width * 8, 32), 2);
    else
       /* RK3568: entries = W * ceil(C/8) / 4 (8-ch atomics, 32-byte entries);
        * matches the vendor stream for every mobilenet_v1 task. */
@@ -349,7 +362,10 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
        * offset is rows * W * 8 (the per-surface stride register covers the
        * upper channel groups). */
       cur_task->input_offset =
-         operation->input_width * 8 * cur_task->top_slice;
+         (operation->input_channels == 3
+             ? DIV_ROUND_UP(operation->input_width * 3, 8) * 8
+             : operation->input_width * 8) *
+         cur_task->top_slice;
       cur_task->output_offset =
          operation->output_width * 8 * output_height_processed;
 
