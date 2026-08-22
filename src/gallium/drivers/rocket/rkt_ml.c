@@ -285,6 +285,18 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
           operation->conv.dilation_height_factor == 1)
          supported = true;
 
+      /* RK3568: a fully-connected-shaped convolution whose weights exceed
+       * the 256 KiB CBUF (e.g. the final 1024->1001 1x1 of mobilenet_v1)
+       * needs the vendor fp16 FC mode, which is not implemented yet -- the
+       * current conv path wedges on it (job timeout). */
+      {
+         unsigned kernels = weight_tensor->dims[0];
+         unsigned wbytes = kernels * weight_tensor->dims[1] *
+                           weight_tensor->dims[2] * weight_tensor->dims[3];
+         if (wbytes > 7 * CBUF_BANK_SIZE)
+            supported = false;
+      }
+
       break;
    }
    case PIPE_ML_OPERATION_TYPE_ADD:

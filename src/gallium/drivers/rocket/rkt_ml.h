@@ -33,6 +33,10 @@
 #define ATOMIC_K_SIZE         16
 
 struct split_task {
+   /* RK3568 depthwise with more than 32 channels runs as one task per
+    * 32-channel group (vendor: full tasks + address-delta tasks); all
+    * buffer addresses shift by this group index. */
+   unsigned channel_group;
    unsigned num;
 
    unsigned top_slice;

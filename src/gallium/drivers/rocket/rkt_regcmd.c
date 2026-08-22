@@ -71,8 +71,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    uint32_t con0 = CNA_CBUF_CON0_WEIGHT_BANK(task->weights_banks) |
                    CNA_CBUF_CON0_DATA_BANK(task->input_banks);
-   if (task_num > 0 && operation->reuse_weights_cbuf)
-      con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
+   if (task_num > 0 && operation->reuse_weights_cbuf) {
+      /* A new depthwise 32-channel group brings new weights -- no reuse on
+       * the first task of each group (vendor t8: CBUF_CON0 without the
+       * reuse bit). */
+      struct split_task *prev = util_dynarray_element(
+         &operation->tasks, struct split_task, task_num - 1);
+      if (prev->channel_group == task->channel_group)
+         con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
+   }
 
    /* BSP-order S_POINTER wakes for ALL sub-units MUST come FIRST in the
     * regcmd (verified by BSP YOLOv5s side-by-side: slots 0-5 of BSP's
@@ -245,7 +252,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            CNA_PAD_CON0_PAD_TOP(task->pad_top));
    EMIT(REG_CNA_FEATURE_DATA_ADDR,
         rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
-           task->input_offset);
+           task->input_offset +
+           task->channel_group * operation->input_width *
+              operation->input_height * 32);
    EMIT(REG_CNA_FC_CON2, 0);
    /* DMA_CON0: FETCH_PIXEL_LEN (bits 15:8) is the per-surface feature fetch
     * length. Mesa previously omitted this field, leaving it 0 which causes
@@ -279,7 +288,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_CNA_DCOMP_CTRL, 0);
    EMIT(REG_CNA_DCOMP_REGNUM, 0);
    {
-      uint32_t weight_pa = rkt_resource(operation->weights)->phys_addr;
+      uint32_t weight_pa = rkt_resource(operation->weights)->phys_addr +
+                           task->channel_group * task->weights_width *
+                              task->weights_height * 32;
       emit_raw(regs, CNA | 0x1, 0x1110, weight_pa);  /* DCOMP_ADDR0 */
       emit_raw(regs, CNA | 0x1, 0x1114, 0);          /* DCOMP_ADDR1 */
       emit_raw(regs, CNA | 0x1, 0x1118, 0);          /* DCOMP_ADDR2 */
@@ -363,7 +374,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
-           task->output_offset);
+           task->output_offset +
+           task->channel_group * operation->output_width *
+              operation->output_height * 32);
    /* TEST (iav RE, 2026-08-21): the vendor stream carries output_width *
     * output_height / 2 here, half of what mesa emits, on all 44 convolution
     * tasks of mobilenet_v1 (checked against the full output tensor, not the
@@ -607,8 +620,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    }
 
    EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
+   /* mesa uses the per-tensor bias-only BS stream: 4 bytes per channel. */
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
-        rkt_resource(operation->biases)->phys_addr);
+        rkt_resource(operation->biases)->phys_addr +
+           task->channel_group * 32 * 4);
    /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
     * and is absent from registers.xml, so mesa never writes it.  The vendor
     * stream in every .rknn writes output_channels - 1 there for all 51 tasks
