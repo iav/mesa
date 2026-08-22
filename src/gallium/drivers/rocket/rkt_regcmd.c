@@ -112,6 +112,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
               CNA_CONV_CON1_ARGB_IN(8);
    }
 
+   /* ARGB (Cin=3) first-layer mode: packed RGB input (vendor: 0xa000). */
+   if (task->input_channels_real == 3)
+      con1 |= CNA_CONV_CON1_ARGB_IN(10);
+
    if (operation->depthwise)
       con1 |= CNA_CONV_CON1_CONV_MODE(3);
 
@@ -139,11 +143,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * input byte count. */
    /* TEST (iav RE, 2026-08-21): the vendor writes RGB_BYTELENGTH only for the
     * ARGB first layer and leaves this at zero everywhere else. */
+   /* ARGB: the vendor writes W * H * 9 here for the RGB first layer. */
    EMIT(REG_CNA_CONV_CON4,
-        con1 ? CNA_CONV_CON4_RGB_BYTELENGTH(task->input_width *
-                                            task->input_height *
-                                            task->input_channels)
-             : 0);
+        task->input_channels_real == 3
+           ? CNA_CONV_CON4_RGB_BYTELENGTH(task->input_width *
+                                          task->input_height * 9)
+           : (con1 ? CNA_CONV_CON4_RGB_BYTELENGTH(task->input_width *
+                                                  task->input_height *
+                                                  task->input_channels)
+                   : 0));
    EMIT(REG_CNA_DATA_SIZE0,
         CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
            CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
@@ -168,12 +176,27 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
     * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
    emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
-            (task->input_width << 16) |
+            ((task->input_channels_real == 3 ? align(task->input_width, 32)
+                                             : task->input_width)
+             << 16) |
                (getenv("RKT_ENTV")
                    ? task->input_width * task->input_channels / 32
                    : task->input_data_entries));
 
-   if (task->input_channels_real == 1) {
+   if (task->input_channels_real == 3) {
+      /* ARGB CVT: (x - 128) * 16384 >> 14 = x - 128 -- shift the raw uint8
+       * input into the signed domain the rest of the pipeline expects; the
+       * alpha lane gets scale 1.  (0xe38e1 = truncate 14 on all three RGB
+       * lanes, vendor-exact.) */
+      emit_raw(regs, CNA | 0x1, REG_CNA_CVT_CON0, 0x000e38e1);
+      EMIT(REG_CNA_CVT_CON1,
+           CNA_CVT_CON1_CVT_SCALE0(16384) | CNA_CVT_CON1_CVT_OFFSET0(0xff80));
+      EMIT(REG_CNA_CVT_CON2,
+           CNA_CVT_CON2_CVT_SCALE1(16384) | CNA_CVT_CON2_CVT_OFFSET1(0xff80));
+      EMIT(REG_CNA_CVT_CON3,
+           CNA_CVT_CON3_CVT_SCALE2(16384) | CNA_CVT_CON3_CVT_OFFSET2(0xff80));
+      EMIT(REG_CNA_CVT_CON4, CNA_CVT_CON4_CVT_SCALE3(1));
+   } else if (task->input_channels_real == 1) {
       unsigned truncate = 14;
       unsigned scale = 16384;
       unsigned offset = 65408;
