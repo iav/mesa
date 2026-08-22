@@ -899,6 +899,9 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
          const char *mo = getenv("TEFLON_MAX_OPS");
          if (mo && i >= atoi(mo))
             supported = false;
+         const char *mi = getenv("TEFLON_MIN_OPS");
+         if (mi && i < atoi(mi))
+            supported = false;
       }
 
       teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
