@@ -17,13 +17,16 @@
  * per row that first band needs 128 slices, which only fits if a bank holds
  * 256 entries of 256 bytes.  With 32768 mesa computed half the capacity and
  * split the same layer into five bands instead of two. */
-#define CBUF_BANK_SIZE        65536
+/* RK3568 (RE 2026-08-22): 8 banks of 32 KiB, 32-byte entries (1024 per
+ * bank).  Verified against all 51 mobilenet_v1 vendor tasks: data banks =
+ * ceil(entries_per_slice * H / 1024), weight banks = 8 - data banks. */
+#define CBUF_BANK_SIZE        32768
 /* CBUF_BANKS is SoC-specific:
  *   RK3588: 12 banks (384 KiB CBUF)
  *   RK3568:  8 banks (256 KiB CBUF) — per RK3568 TRM Part2 section 9.1
  * TODO: select per-SoC at runtime via rkt_device. */
 #define CBUF_BANKS            8
-#define CBUF_ENTRIES_PER_BANK 256
+#define CBUF_ENTRIES_PER_BANK 1024
 #define CBUF_ENTRY_SIZE       (CBUF_BANK_SIZE / CBUF_ENTRIES_PER_BANK)
 #define FEATURE_ATOMIC_SIZE   16
 #define WEIGHT_ATOMIC_SIZE    32
