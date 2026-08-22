@@ -55,6 +55,22 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
    unsigned input_channels_2 = MIN2(input_channels, input_channel_groups);
 
    unsigned n = 0;
+   if (rkt_is_depthwise(poperation) && input_channels_real > 32) {
+      /* RK3568 depthwise with C>32: one 32-channel group per task; the
+       * weight buffer is [group][tap (row-major)][32 channels], so the
+       * per-group DCOMP_ADDR0 offset of KH*KW*32 bytes lands on a group
+       * boundary (vendor mobilenet_v1 t8: DCOMP_ADDR0 = 288). */
+      for (unsigned g = 0; g < DIV_ROUND_UP(input_channels_real, 32); g++)
+         for (int y = 0; y < weights_height; y++)
+            for (int x = 0; x < weights_width; x++)
+               for (unsigned c = 0; c < 32; c++) {
+                  unsigned ic = g * 32 + c;
+                  weights_out[n++] = ic < input_channels_real
+                                        ? weights_in[0][y][x][ic] - 0x80
+                                        : 0;
+               }
+      goto packed;
+   }
    if (!rkt_is_depthwise(poperation)) {
       /* RK3568 regular-conv weight layout, solved by probe-model RE
        * (2026-08-22, Test 43): known-weight models converted with
