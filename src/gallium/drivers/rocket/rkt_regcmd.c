@@ -229,10 +229,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * all 44 convolution tasks of mobilenet_v1 and all 23 of resnet18, across
     * every geometry -- FETCH_PIXEL_LEN is a constant 28, not input_width, and
     * both burst lengths are 7, not 15. */
-   EMIT(REG_CNA_DMA_CON0,
-        CNA_DMA_CON0_WEIGHT_BURST_LEN(7) |
-        CNA_DMA_CON0_FETCH_PIXEL_LEN(28) |
-        CNA_DMA_CON0_DATA_BURST_LEN(7));
+   /* RK3568 (vendor librknnrt 1.5.2, RE 2026-08-22): write the vendor value
+    * verbatim.  Bit 20 is RESERVED in the XML, so assembling this register
+    * from named fields silently drops it (0x071c07 instead of 0x171c07),
+    * and without bit 20 the MAC array never sees real data: the output of
+    * every regular convolution is an input-independent constant. */
+   EMIT(REG_CNA_DMA_CON0, 0x00171c07);
    EMIT(REG_CNA_DMA_CON1, CNA_DMA_CON1_LINE_STRIDE(task->input_line_stride));
    EMIT(REG_CNA_DMA_CON2, CNA_DMA_CON2_SURF_STRIDE(task->input_surface_stride));
 
