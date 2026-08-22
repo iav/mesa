@@ -14,7 +14,12 @@ calc_entries_per_slice(struct rkt_operation *operation)
     * against all 51 mobilenet_v1 vendor tasks: entries = W * ceil(C/8) / 4
     * reproduces every DATA_ENTRIES value (C = 8..512, W = 7..224). */
    unsigned atomics_per_entry = 4;
-   unsigned total_c_atomics = DIV_ROUND_UP(operation->input_channels, 8);
+   /* Depthwise with C>32 runs as 32-channel-group tasks -- CBUF holds one
+    * group at a time. */
+   unsigned eff_channels = operation->depthwise
+                              ? MIN2(operation->input_channels, 32)
+                              : operation->input_channels;
+   unsigned total_c_atomics = DIV_ROUND_UP(eff_channels, 8);
    unsigned last_c_atomics = total_c_atomics % atomics_per_entry;
    unsigned int_c_entries =
       (total_c_atomics / atomics_per_entry) * operation->input_width;
@@ -83,6 +88,12 @@ fill_task(struct rkt_ml_subgraph *subgraph,
          : align(MAX2(operation->input_channels, FEATURE_ATOMIC_SIZE),
                  FEATURE_ATOMIC_SIZE);
    task->input_channels_real = operation->input_channels;
+   /* Depthwise with C>32: each task covers one 32-channel group (vendor
+    * t6..t9 of mobilenet_v1). */
+   if (operation->depthwise && operation->input_channels > 32) {
+      task->input_channels = 32;
+      task->input_channels_real = 32;
+   }
    task->input_zero_point = operation->input_zero_point;
    task->input_scale = operation->input_scale;
 
@@ -91,6 +102,10 @@ fill_task(struct rkt_ml_subgraph *subgraph,
 
    task->output_channels_real = operation->output_channels;
    task->output_channels = align(MAX2(operation->output_channels, 32), 32);
+   if (operation->depthwise && operation->input_channels > 32) {
+      task->output_channels_real = 32;
+      task->output_channels = 32;
+   }
    /* TEST (iav RE, 2026-08-21): RK3568 wants the real channel count on
     * depthwise.  The vendor stream carries 32 channels for every 32-channel
     * depthwise layer of mobilenet_v1 (DPU_DATA_CUBE_CHANNEL 0x001f001f),
@@ -228,12 +243,27 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
 
       util_dynarray_append(&operation->tasks, task);
 
+      if (operation->depthwise && operation->input_channels > 32) {
+         unsigned groups = DIV_ROUND_UP(operation->input_channels, 32);
+         for (unsigned g = 1; g < groups; g++) {
+            struct split_task copy = task;
+            copy.channel_group = g;
+            copy.num = g;
+            util_dynarray_append(&operation->tasks, copy);
+         }
+      }
+
       return;
    }
 
    struct split_task task = {0};
    unsigned available_slices =
       (CBUF_ENTRIES_PER_BANK * available_input_banks) / entries_per_slice;
+   /* TEST: RKT_MAXROWS=N caps the band height -- forces more bands to probe
+    * multi-task pipelines. */
+   if (getenv("RKT_MAXROWS"))
+      available_slices = MIN2(available_slices,
+                              (unsigned)atoi(getenv("RKT_MAXROWS")));
 
    task.num = 0;
    fill_task(subgraph, operation, &task);
@@ -373,5 +403,23 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
       cur_task->weights_banks = available_weights_banks;
 
       output_height_processed += cur_task->output_height;
+   }
+
+   /* Depthwise with C>32: duplicate every band once per 32-channel group;
+    * rkt_fill_regcmd shifts the buffer addresses by the group index. */
+   if (operation->depthwise && operation->input_channels > 32) {
+      unsigned groups = DIV_ROUND_UP(operation->input_channels, 32);
+      unsigned bands =
+         util_dynarray_num_elements(&operation->tasks, struct split_task);
+      for (unsigned g = 1; g < groups; g++) {
+         for (unsigned b = 0; b < bands; b++) {
+            struct split_task copy = *util_dynarray_element(
+               &operation->tasks, struct split_task, b);
+            copy.channel_group = g;
+            copy.num =
+               util_dynarray_num_elements(&operation->tasks, struct split_task);
+            util_dynarray_append(&operation->tasks, copy);
+         }
+      }
    }
 }
