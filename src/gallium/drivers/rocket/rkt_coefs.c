@@ -88,46 +88,44 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
        * always at most 32 bytes). */
       /* ARGB / few-channel input (Cin<=8, probe-RGB byte-exact): the kernel
        * row is 8 bytes -- ic then zero padding to 8. */
-      unsigned rowic = input_channels_real <= 8
-                          ? 8
-                          : MIN2(align(input_channels_real, 16), 32);
+      /* Compact tails, generalized (mobilenet_v2 RE 2026-08-23, WPOKE map on
+       * op8 Cin=144/Cout=24): the tail ic slice (Cin % 32) uses
+       * align(rem, 16)-byte kernel rows (16 bytes for a 16-channel tail,
+       * poke 2064 -> oc1), and the tail kernel group (Cout % 16) is stored
+       * compactly for EVERY conv, not just FC-shaped ones.  Groups follow
+       * each other without padding; the WEIGHT_BYTES register already
+       * matches this compact size (op8: 24 * 144 = 3456). */
       unsigned slices = DIV_ROUND_UP(input_channels_real, 32);
       unsigned kgroups = DIV_ROUND_UP(output_channels_real, 16);
-      unsigned slcblk = 16 * rowic;
-      unsigned tapblk = slices * slcblk;
-      unsigned grpblk = weights_width * weights_height * tapblk;
-      /* FC-shaped (1x1 input): the vendor stores the LAST kernel group
-       * compactly -- K%16 rows, no padding to 16 (probe-FCL byte-exact:
-       * 1001 kernels = 62 full groups + a 9-row tail, 1025024 bytes). */
-      bool fc_like = poperation->input_tensors[0]->dims[1] == 1 &&
-                     poperation->input_tensors[0]->dims[2] == 1;
-      unsigned tail_rows =
-         (fc_like && (output_channels_real % 16)) ? output_channels_real % 16
-                                                  : 16;
-      unsigned full_groups = tail_rows == 16 ? kgroups : kgroups - 1;
+      unsigned rem_ic = input_channels_real % 32;
+      unsigned row_tail = input_channels_real <= 8
+                             ? 8
+                             : rem_ic ? MIN2(align(rem_ic, 16), 32) : 32;
+      /* bytes of one kernel row across all ic slices */
+      unsigned rowsum = (slices - 1) * 32 + row_tail;
 
       memset(weights_out, zero_point - 0x80, weights_size);
-      for (unsigned oc = 0; oc < output_channels_real; oc++) {
-         unsigned g = oc / 16;
-         unsigned rows = g < full_groups ? 16 : tail_rows;
-         unsigned gslcblk = rows * rowic;
-         unsigned gtapblk = slices * gslcblk;
-         for (unsigned ky = 0; ky < weights_width; ky++) {
-            for (unsigned kx = 0; kx < weights_height; kx++) {
-               for (unsigned ic = 0; ic < input_channels_real; ic++) {
-                  unsigned pos = g * grpblk +
-                                 (ky * weights_height + kx) * gtapblk +
-                                 (ic / 32) * gslcblk +
-                                 (oc % 16) * rowic + (ic % 32);
-                  weights_out[pos] = weights_in[oc][ky][kx][ic] - 0x80;
+      unsigned goff = 0;
+      for (unsigned g = 0; g < kgroups; g++) {
+         unsigned rows = MIN2(16, output_channels_real - g * 16);
+         unsigned gtapblk = rows * rowsum;
+         for (unsigned oc = g * 16; oc < g * 16 + rows; oc++) {
+            for (unsigned ky = 0; ky < weights_width; ky++) {
+               for (unsigned kx = 0; kx < weights_height; kx++) {
+                  unsigned tap = ky * weights_height + kx;
+                  for (unsigned ic = 0; ic < input_channels_real; ic++) {
+                     unsigned s = ic / 32;
+                     unsigned rowbytes = (s == slices - 1) ? row_tail : 32;
+                     unsigned pos = goff + tap * gtapblk + s * rows * 32 +
+                                    (oc % 16) * rowbytes + (ic % 32);
+                     weights_out[pos] = weights_in[oc][ky][kx][ic] - 0x80;
+                  }
                }
             }
          }
+         goff += weights_width * weights_height * gtapblk;
       }
-      n = full_groups * grpblk +
-          (tail_rows == 16
-              ? 0
-              : weights_width * weights_height * slices * tail_rows * rowic);
+      n = goff;
       assert(n <= weights_size);
       goto packed;
    }
