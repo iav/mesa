@@ -10,7 +10,8 @@
 
 struct pipe_resource *
 rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
-                 const struct pipe_ml_operation *poperation);
+                 const struct pipe_ml_operation *poperation,
+                 unsigned pad_kernels);
 
 struct pipe_resource *
 rkt_fill_biases(struct rkt_ml_subgraph *subgraph,

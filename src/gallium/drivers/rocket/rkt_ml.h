@@ -120,6 +120,10 @@ struct rkt_operation {
    unsigned output_width;
    unsigned output_height;
    unsigned output_channels;
+   /* Non-zero: pad the kernel count to this (RK3568 fused adds with
+    * C % 32 != 0 run as align(C, 32)-kernel convolutions with zero
+    * weights/biases in the tail; the unpack still uses output_channels). */
+   unsigned output_channels_pad;
    uint8_t output_zero_point;
    float output_scale;
 
