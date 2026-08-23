@@ -543,6 +543,38 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
       compile_operation(subgraph, operation);
    }
 
+   /* Link every operation's last regcmd stream to the next operation's
+    * first one through the PC tail, the same way compile_operation links
+    * tasks inside an operation: the whole graph then runs as one PC task
+    * chain in a single kernel job (one IRQ+fence round trip instead of
+    * one per operation, ~0.2 ms each on RK3568). */
+   if (!getenv("RKT_NO_CHAIN")) {
+      unsigned num_ops = util_dynarray_num_elements(&subgraph->operations,
+                                                    struct rkt_operation);
+      for (unsigned i = 0; i + 1 < num_ops; i++) {
+         struct rkt_operation *op = util_dynarray_element(
+            &subgraph->operations, struct rkt_operation, i);
+         struct rkt_operation *next = util_dynarray_element(
+            &subgraph->operations, struct rkt_operation, i + 1);
+         struct split_task *last = util_dynarray_element(
+            &op->tasks, struct split_task,
+            util_dynarray_num_elements(&op->tasks, struct split_task) - 1);
+         struct split_task *first =
+            util_dynarray_element(&next->tasks, struct split_task, 0);
+         struct pipe_transfer *xfer = NULL;
+         uint64_t *words =
+            pipe_buffer_map(subgraph->context, op->regcmd, PIPE_MAP_READ_WRITE, &xfer);
+         unsigned base = (last->regcfg_addr -
+                          rkt_resource(op->regcmd)->phys_addr) /
+                         sizeof(uint64_t);
+         uint64_t *tail = words + base + last->regcfg_amount;
+
+         tail[-4] |= (uint64_t)first->regcfg_addr << 16;
+         tail[-3] |= (uint64_t)(first->regcfg_amount - 1) << 16;
+         pipe_buffer_unmap(subgraph->context, xfer);
+      }
+   }
+
    return &subgraph->base;
 }
 
@@ -652,6 +684,93 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
 
    struct util_dynarray jobs = UTIL_DYNARRAY_INIT;
 
+   /* Chained submit: the graph's regcmd streams were linked at compile
+    * time, so the whole network is ONE job.  External inputs go on the
+    * in list, every operation output on the out list; intermediates are
+    * both read and written inside the job, and a BO repeated across the
+    * two lists wedges the scheduler -- they are covered by the out list
+    * entry alone. */
+   if (!getenv("RKT_NO_CHAIN")) {
+      unsigned num_ops = util_dynarray_num_elements(&subgraph->operations,
+                                                    struct rkt_operation);
+      unsigned total_tasks = 0;
+      util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
+         total_tasks +=
+            util_dynarray_num_elements(&op->tasks, struct split_task);
+
+      struct drm_rocket_task *tasks = calloc(total_tasks, sizeof(*tasks));
+      uint32_t *in_bo_handles = calloc(num_ops * 2, sizeof(uint32_t));
+      uint32_t *out_bo_handles = calloc(num_ops, sizeof(uint32_t));
+      unsigned num_inputs = 0, num_outputs = 0, ti = 0;
+
+      util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                             op) {
+         util_dynarray_foreach (&op->tasks, struct split_task, task) {
+            tasks[ti].regcmd = task->regcfg_addr;
+            tasks[ti].regcmd_count = task->regcfg_amount;
+            ti++;
+         }
+
+         unsigned reads[2] = {op->input_index, ~0u};
+         if (op->add_tensor != -1)
+            reads[1] = op->add_tensor;
+         for (unsigned r = 0; r < 2; r++) {
+            if (reads[r] == ~0u || find_producer(subgraph, reads[r]) != NULL)
+               continue;
+            uint32_t handle = rkt_get_tensor(subgraph, reads[r])->handle;
+            bool seen = false;
+            for (unsigned k = 0; k < num_inputs; k++)
+               seen |= in_bo_handles[k] == handle;
+            if (!seen)
+               in_bo_handles[num_inputs++] = handle;
+         }
+
+         uint32_t out_handle =
+            rkt_get_tensor(subgraph, op->output_index)->handle;
+         bool seen = false;
+         for (unsigned k = 0; k < num_outputs; k++)
+            seen |= out_bo_handles[k] == out_handle;
+         if (!seen)
+            out_bo_handles[num_outputs++] = out_handle;
+      }
+
+      struct pc_task_desc {
+         uint32_t flags, op_idx, enable_mask, int_mask, int_clear,
+                  int_status, regcfg_amount, regcfg_offset;
+         uint64_t regcmd_addr;
+      } __attribute__((packed));
+      struct pipe_resource *descs_rsc = pipe_buffer_create(
+         pcontext->screen, 0, PIPE_USAGE_DEFAULT,
+         total_tasks * sizeof(struct pc_task_desc));
+      struct pipe_transfer *xfer = NULL;
+      struct pc_task_desc *d =
+         pipe_buffer_map(pcontext, descs_rsc, PIPE_MAP_WRITE, &xfer);
+      for (unsigned k = 0; k < total_tasks; k++) {
+         d[k].flags = 0;
+         d[k].op_idx = k + 1;
+         d[k].enable_mask = 0x1f;
+         d[k].int_mask = 0x300;
+         d[k].int_clear = 0x1ffff;
+         d[k].int_status = 0;
+         d[k].regcfg_amount = tasks[k].regcmd_count - 1;
+         d[k].regcfg_offset = 0;
+         d[k].regcmd_addr = tasks[k].regcmd;
+      }
+      pipe_buffer_unmap(pcontext, xfer);
+      util_dynarray_element(&subgraph->operations, struct rkt_operation, 0)
+         ->task_descs = descs_rsc;
+
+      struct drm_rocket_job job = {0};
+      job.task_struct_size = sizeof(struct drm_rocket_task);
+      job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
+      job.in_bo_handle_count = num_inputs;
+      job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
+      job.out_bo_handle_count = num_outputs;
+      job.tasks = (uint64_t)(uintptr_t)tasks;
+      job.task_count = total_tasks;
+      job.task_desc_addr = rkt_resource(descs_rsc)->phys_addr;
+      util_dynarray_append(&jobs, job);
+   } else
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
                           operation) {
       unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;

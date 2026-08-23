@@ -675,10 +675,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0x0);
 
-   if (num_tasks == 1)
-      util_dynarray_append_typed(regs, uint64_t, 0x0);
-   else
-      EMIT(REG_PC_BASE_ADDRESS, 0);
+   /* Always a real PC_BASE_ADDRESS command word, even for a single-task
+    * stream: the cross-operation chain (compile_operation /
+    * chain_operations) patches the next stream's address into it, and a
+    * bare zero word cannot be patched with |=. */
+   EMIT(REG_PC_BASE_ADDRESS, 0);
 
    EMIT(REG_PC_REGISTER_AMOUNTS, 0);
 
