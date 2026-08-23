@@ -101,11 +101,16 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    task->output_height = operation->output_height;
 
    task->output_channels_real = operation->output_channels;
-   task->output_channels = align(MAX2(operation->output_channels, 32), 32);
-   /* FC-shaped convolution (1x1 spatial input): the vendor aligns the
-    * output channels to 16, not 32 (mobilenet_v1 t50: 1001 -> 1008). */
-   if (operation->input_width == 1 && operation->input_height == 1)
-      task->output_channels = align(MAX2(operation->output_channels, 16), 16);
+   /* Announced DPU output channels: align(Cout, 16) with NO 32 floor
+    * (mobilenet_v2 RE 2026-08-23).  The old align-to-32 made the DPU wait
+    * for surfaces that never come on Cout=16 convs, so every band task
+    * after the first produced nothing (op2).  Matches the vendor's FC task
+    * too (mobilenet_v1 t50: 1001 -> 1008).  RKT_OUTALIGN overrides. */
+   task->output_channels = align(MAX2(operation->output_channels, 16), 16);
+   if (getenv("RKT_OUTALIGN")) {
+      unsigned a = atoi(getenv("RKT_OUTALIGN"));
+      task->output_channels = align(operation->output_channels, a);
+   }
    if (operation->depthwise && operation->input_channels > 32) {
       task->output_channels_real = 32;
       task->output_channels = 32;
