@@ -50,7 +50,8 @@ calc_weights_banks(struct rkt_operation *operation)
    unsigned banks;
 
    if (!operation->depthwise)
-      bytes *= operation->output_channels;
+      bytes *= operation->output_channels_pad ? operation->output_channels_pad
+                                              : operation->output_channels;
    entries = DIV_ROUND_UP(bytes, CBUF_ENTRY_SIZE);
    banks = DIV_ROUND_UP(entries, CBUF_ENTRIES_PER_BANK);
 
@@ -100,16 +101,21 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    task->output_width = operation->output_width;
    task->output_height = operation->output_height;
 
-   task->output_channels_real = operation->output_channels;
+   /* Fused adds with C % 32 run as padded convolutions (zero kernels in
+    * the tail): everything below sees the padded count. */
+   unsigned oc_eff = operation->output_channels_pad
+                        ? operation->output_channels_pad
+                        : operation->output_channels;
+   task->output_channels_real = oc_eff;
    /* Announced DPU output channels: align(Cout, 16) with NO 32 floor
     * (mobilenet_v2 RE 2026-08-23).  The old align-to-32 made the DPU wait
     * for surfaces that never come on Cout=16 convs, so every band task
     * after the first produced nothing (op2).  Matches the vendor's FC task
     * too (mobilenet_v1 t50: 1001 -> 1008).  RKT_OUTALIGN overrides. */
-   task->output_channels = align(MAX2(operation->output_channels, 16), 16);
+   task->output_channels = align(MAX2(oc_eff, 16), 16);
    if (getenv("RKT_OUTALIGN")) {
       unsigned a = atoi(getenv("RKT_OUTALIGN"));
-      task->output_channels = align(operation->output_channels, a);
+      task->output_channels = align(oc_eff, a);
    }
    if (operation->depthwise && operation->input_channels > 32) {
       task->output_channels_real = 32;
@@ -194,7 +200,10 @@ fill_task(struct rkt_ml_subgraph *subgraph,
       /* FC-shaped: the vendor keeps the exact kernel count (1001). */
       task->weights_kernels = operation->output_channels;
    else
-      task->weights_kernels = align(operation->output_channels, 2);
+      task->weights_kernels =
+         align(operation->output_channels_pad ? operation->output_channels_pad
+                                              : operation->output_channels,
+               2);
 
    /* RK3568 (vendor librknnrt 1.5.2, RE 2026-08-20): DPU SURFACE_ADD is the
     * output surface size in 16-byte cells = Wout * Hout, i.e. equal to

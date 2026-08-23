@@ -847,6 +847,51 @@ fused_relu6_supported(TfLiteTensor *tensor)
    return true;
 }
 
+/* RK3568 (iav RE 2026-08-23): a fused conv+add whose convolution has to be
+ * split into row bands misreads the second EW input on every surface pair
+ * but the first (the per-band EW base offset is not applied there).  Until
+ * that addressing is understood, keep such adds on the CPU.  The band
+ * split happens when the producer convolution's input feature map does not
+ * fit the CBUF data banks; replicate that estimate here from the tensor
+ * shapes (8-byte feature atomics, 32-byte CBUF entries, 8 banks of 1024
+ * entries). */
+static bool
+add_producer_is_banded(TfLiteContext *tf_context, TfLiteNode *add_node)
+{
+   TfLiteIntArray *plan;
+   if (tf_context->GetExecutionPlan(tf_context, &plan) != kTfLiteOk)
+      return true; /* be conservative */
+
+   int in_tensor = add_node->inputs->data[0];
+   for (int i = 0; i < plan->size; i++) {
+      TfLiteNode *n;
+      TfLiteRegistration *reg;
+      if (tf_context->GetNodeAndRegistration(tf_context, plan->data[i], &n,
+                                             &reg) != kTfLiteOk)
+         continue;
+      if (n->outputs->size < 1 || n->outputs->data[0] != in_tensor)
+         continue;
+      if (reg->builtin_code != kTfLiteBuiltinConv2d &&
+          reg->builtin_code != kTfLiteBuiltinDepthwiseConv2d)
+         return true; /* unknown producer: conservative */
+
+      TfLiteTensor *in = &tf_context->tensors[n->inputs->data[0]];
+      TfLiteTensor *w = &tf_context->tensors[n->inputs->data[1]];
+      if (in->dims->size != 4 || w->dims->size != 4)
+         return true;
+      unsigned h = in->dims->data[1], wd = in->dims->data[2],
+               c = in->dims->data[3];
+      unsigned kernels = w->dims->data[0], kh = w->dims->data[1],
+               kw = w->dims->data[2], kc = w->dims->data[3];
+      unsigned entries_per_row = wd * DIV_ROUND_UP(c, 8) / 4;
+      unsigned data_banks = DIV_ROUND_UP(entries_per_row * h, 1024);
+      unsigned weight_banks =
+         DIV_ROUND_UP(align(kernels, 32) * kh * kw * kc, 32 * 1024);
+      return data_banks > 8 - MAX2(weight_banks, 1);
+   }
+   return true; /* producer outside the graph: conservative */
+}
+
 static bool
 check_op_support(TfLiteDelegate *tf_delegate, TfLiteContext *tf_context, TfLiteNode *node, TfLiteRegistration *registration)
 {
@@ -858,6 +903,10 @@ check_op_support(TfLiteDelegate *tf_delegate, TfLiteContext *tf_context, TfLiteN
       return false;
 
    supported = delegate->ml_dev->ml_operation_supported(delegate->ml_dev, &operation);
+
+   if (supported && registration->builtin_code == kTfLiteBuiltinAdd &&
+       add_producer_is_banded(tf_context, node))
+      supported = false;
 
    free_operation(&operation);
 

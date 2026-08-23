@@ -13,7 +13,8 @@
 
 struct pipe_resource *
 rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
-                 const struct pipe_ml_operation *poperation)
+                 const struct pipe_ml_operation *poperation,
+                 unsigned pad_kernels)
 {
    struct pipe_context *pcontext = subgraph->context;
    unsigned weights_width = poperation->conv.weight_tensor->dims[1];
@@ -95,8 +96,12 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
        * compactly for EVERY conv, not just FC-shaped ones.  Groups follow
        * each other without padding; the WEIGHT_BYTES register already
        * matches this compact size (op8: 24 * 144 = 3456). */
+      /* Kernel padding for fused adds (C % 32): the group geometry runs
+       * over the padded count; the memset background (zero_point - 0x80)
+       * is exactly a zero weight, so only the real kernels are written. */
+      unsigned geom_kernels = pad_kernels ? pad_kernels : output_channels_real;
       unsigned slices = DIV_ROUND_UP(input_channels_real, 32);
-      unsigned kgroups = DIV_ROUND_UP(output_channels_real, 16);
+      unsigned kgroups = DIV_ROUND_UP(geom_kernels, 16);
       unsigned rem_ic = input_channels_real % 32;
       unsigned row_tail = input_channels_real <= 8
                              ? 8
@@ -107,9 +112,10 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       memset(weights_out, zero_point - 0x80, weights_size);
       unsigned goff = 0;
       for (unsigned g = 0; g < kgroups; g++) {
-         unsigned rows = MIN2(16, output_channels_real - g * 16);
+         unsigned rows = MIN2(16, geom_kernels - g * 16);
          unsigned gtapblk = rows * rowsum;
-         for (unsigned oc = g * 16; oc < g * 16 + rows; oc++) {
+         for (unsigned oc = g * 16;
+              oc < MIN2(g * 16 + rows, output_channels_real); oc++) {
             for (unsigned ky = 0; ky < weights_width; ky++) {
                for (unsigned kx = 0; kx < weights_height; kx++) {
                   unsigned tap = ky * weights_height + kx;

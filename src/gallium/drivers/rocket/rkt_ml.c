@@ -168,7 +168,7 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
 static void
 lower_convolution(struct rkt_ml_subgraph *subgraph,
                   const struct pipe_ml_operation *poperation,
-                  struct rkt_operation *operation)
+                  struct rkt_operation *operation, unsigned pad_channels)
 {
    operation->tasks = UTIL_DYNARRAY_INIT;
 
@@ -198,7 +198,8 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
    operation->weights_scale = poperation->conv.weight_tensor->scale;
 
-   operation->weights = rkt_fill_weights(subgraph, poperation);
+   operation->output_channels_pad = pad_channels;
+   operation->weights = rkt_fill_weights(subgraph, poperation, pad_channels);
    operation->biases =
       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
 }
@@ -245,7 +246,7 @@ lower_pooling(struct rkt_ml_subgraph *subgraph,
    conv.conv.dilation_width_factor = 1;
    conv.conv.dilation_height_factor = 1;
 
-   lower_convolution(subgraph, &conv, operation);
+   lower_convolution(subgraph, &conv, operation, 0);
 
    free(wdata);
    free(bdata);
@@ -355,13 +356,6 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
    case PIPE_ML_OPERATION_TYPE_ADD:
       supported = operation->input_tensors[0]->data == NULL &&
                   operation->input_tensors[1]->data == NULL;
-      /* RK3568 (RE 2026-08-23): with a channel count not divisible by 32
-       * the EW RDMA reads the last surface pair of the second input
-       * garbled (mobilenet_v2 add9, C=24: channels 16-23 deterministic
-       * noise while 0-15 are exact).  Until that addressing is understood,
-       * leave such adds on the CPU -- in mobilenet_v2 this is a single op. */
-      if (operation->input_tensors[0]->dims[3] % 32)
-         supported = false;
       break;
    case PIPE_ML_OPERATION_TYPE_POOLING:
       /* Average pooling runs as a depthwise convolution with constant
@@ -384,6 +378,27 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
    }
 
    return supported;
+}
+
+/* RK3568 fused adds with C %% 32 != 0: the EW RDMA misreads the second
+ * surface pair, so the fused convolution instead runs with its kernel
+ * count padded to align(C, 32) (zero weights/biases in the tail).  Find
+ * the pad for a convolution that an ADD later fuses into. */
+static unsigned
+fused_add_pad(const struct pipe_ml_operation *poperations, unsigned count,
+              const struct pipe_ml_operation *conv)
+{
+   for (unsigned i = 0; i < count; i++) {
+      if (poperations[i].type != PIPE_ML_OPERATION_TYPE_ADD)
+         continue;
+      unsigned c = poperations[i].output_tensors[0]->dims[3];
+      if (c % 32 == 0)
+         continue;
+      if (poperations[i].input_tensors[0]->index ==
+          conv->output_tensors[0]->index)
+         return align(c, 32);
+   }
+   return 0;
 }
 
 struct pipe_ml_subgraph *
@@ -418,7 +433,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
       switch (poperations[i].type) {
       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
-         lower_convolution(subgraph, &poperations[i], &operation);
+         lower_convolution(subgraph, &poperations[i], &operation,
+                           fused_add_pad(poperations, count, &poperations[i]));
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING:
