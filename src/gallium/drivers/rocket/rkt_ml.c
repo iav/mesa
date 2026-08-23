@@ -355,6 +355,13 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
    case PIPE_ML_OPERATION_TYPE_ADD:
       supported = operation->input_tensors[0]->data == NULL &&
                   operation->input_tensors[1]->data == NULL;
+      /* RK3568 (RE 2026-08-23): with a channel count not divisible by 32
+       * the EW RDMA reads the last surface pair of the second input
+       * garbled (mobilenet_v2 add9, C=24: channels 16-23 deterministic
+       * noise while 0-15 are exact).  Until that addressing is understood,
+       * leave such adds on the CPU -- in mobilenet_v2 this is a single op. */
+      if (operation->input_tensors[0]->dims[3] % 32)
+         supported = false;
       break;
    case PIPE_ML_OPERATION_TYPE_POOLING:
       /* Average pooling runs as a depthwise convolution with constant
@@ -437,6 +444,13 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          }
 
          input_op_2->output_index = poperations[i].output_tensors[0]->index;
+         /* The fused task requants into the ADD's output domain, not the
+          * convolution's (mobilenet_v2 RE 2026-08-23: with the conv's old
+          * zp/scale left here, OUT_CVT used zp 136 instead of the add
+          * output's 133 and the whole residual sum came out shifted). */
+         input_op_2->output_zero_point =
+            poperations[i].output_tensors[0]->zero_point;
+         input_op_2->output_scale = poperations[i].output_tensors[0]->scale;
          input_op_2->addition_offset =
             0x80 - poperations[i].input_tensors[1]->zero_point;
          input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
