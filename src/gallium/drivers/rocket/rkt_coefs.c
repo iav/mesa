@@ -85,8 +85,11 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
        * i.e. kernel groups of SIXTEEN (not 32 as on RK3588), tap-major inside
        * a group, 16 kernels per tap block, ic last.  Bytes are w - 0x80. */
       /* ic dimension is cut into 32-channel slices that sit ABOVE the
-       * 16-kernel rows (verified with a Cin=64 probe model: kernel row is
-       * always at most 32 bytes). */
+       * taps: the order inside a 16-kernel group is [ic-slice][tap][oc%16]
+       * [ic%32] (probe-DENSE128, a 3x3 Cin=128 dense probe, byte-exact
+       * 0/36864 against the vendor packing; the old slice-under-tap order
+       * was indistinguishable on 1x1 convolutions, which is all mobilenet
+       * v1/v2 exercise with more than one slice). */
       /* ARGB / few-channel input (Cin<=8, probe-RGB byte-exact): the kernel
        * row is 8 bytes -- ic then zero padding to 8. */
       /* Compact tails, generalized (mobilenet_v2 RE 2026-08-23, WPOKE map on
@@ -126,7 +129,10 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
                   for (unsigned ic = 0; ic < input_channels_real; ic++) {
                      unsigned s = ic / 32;
                      unsigned rowbytes = (s == slices - 1) ? row_tail : 32;
-                     unsigned pos = goff + tap * gtapblk + s * rows * 32 +
+                     unsigned pos = goff +
+                                    s * weights_width * weights_height *
+                                       rows * 32 +
+                                    tap * rows * rowbytes +
                                     (oc % 16) * rowbytes + (ic % 32);
                      weights_out[pos] = weights_in[oc][ky][kx][ic] - 0x80;
                   }
