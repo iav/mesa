@@ -402,9 +402,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * output_height / 2 here, half of what mesa emits, on all 44 convolution
     * tasks of mobilenet_v1 (checked against the full output tensor, not the
     * per-task band).  DPU_SURFACE_ADD at 0x40c0 keeps the undivided value. */
-   EMIT(REG_DPU_DST_SURF_STRIDE,
-        DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(
-           MAX2(task->output_surface_stride / 2, 1)));
+   /* DST_SURF_STRIDE is in BYTES: Wout*Hout*8 (one 8-byte pixel per
+    * surface row position).  The generated helper shifts by 4, so the old
+    * value/2 form was the same number for even Wout*Hout -- but a 1x1
+    * output needs 8, which the shifted field cannot express (this is why
+    * the vendor writes a raw 8 for the FC and avgpool tasks). */
+   emit_raw(regs, DPU | 0x1, REG_DPU_DST_SURF_STRIDE,
+            task->output_surface_stride * 8);
    EMIT(REG_DPU_DATA_CUBE_WIDTH,
         DPU_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_DATA_CUBE_HEIGHT,
