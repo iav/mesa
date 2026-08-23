@@ -108,6 +108,7 @@ struct rkt_operation {
    bool addition_input;
    int addition_offset;
    float addition_scale;
+   bool addition_relu;
 
    unsigned input_index;
    unsigned input_width;

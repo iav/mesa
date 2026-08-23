@@ -483,11 +483,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * -- the vendor's task 3 encodes that ratio (366.0) as 23423 >> 6
        * with the same 15-bit mantissa rule OUT_CVT uses.  OUT_CVT then
        * finishes with the usual conv_scale = si*sw/so for the sum. */
-      /* The vendor word has EW_RELU_BYPASS (bit 9) clear because resnet18
-       * fuses conv+add+RELU; mobilenet_v2's residual adds are linear, so
-       * bypass the EW relu (a fused relu after add would still be enforced
-       * by the u8 saturation when the output zero point is 0). */
-      emit_raw(regs, DPU | 0x1, REG_DPU_EW_CFG, 0x900000d0 | (1 << 9));
+      /* The vendor word has EW_RELU_BYPASS (bit 9) clear when the ADD
+       * carries a fused RELU (resnet18-style conv+add+RELU blocks);
+       * mobilenet_v2's residual adds are linear and set the bypass. */
+      emit_raw(regs, DPU | 0x1, REG_DPU_EW_CFG,
+               0x900000d0 | (operation->addition_relu ? 0 : 1 << 9));
       EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, operation->addition_offset);
 
       float ew_scale_f = operation->addition_scale /

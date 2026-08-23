@@ -388,14 +388,26 @@ static unsigned
 fused_add_pad(const struct pipe_ml_operation *poperations, unsigned count,
               const struct pipe_ml_operation *conv)
 {
+   unsigned conv_idx = conv - poperations;
    for (unsigned i = 0; i < count; i++) {
       if (poperations[i].type != PIPE_ML_OPERATION_TYPE_ADD)
          continue;
       unsigned c = poperations[i].output_tensors[0]->dims[3];
       if (c % 32 == 0)
          continue;
-      if (poperations[i].input_tensors[0]->index ==
-          conv->output_tensors[0]->index)
+      unsigned out = conv->output_tensors[0]->index;
+      unsigned in0 = poperations[i].input_tensors[0]->index;
+      unsigned in1 = poperations[i].input_tensors[1]->index;
+      if (out != in0 && out != in1)
+         continue;
+      /* Only the fuse host (the later of the two producers, see the ADD
+       * lowering) grows its kernel count. */
+      unsigned other = out == in0 ? in1 : in0;
+      bool later = true;
+      for (unsigned j = conv_idx + 1; j < count; j++)
+         if (poperations[j].output_tensors[0]->index == other)
+            later = false;
+      if (later)
          return align(c, 32);
    }
    return 0;
@@ -442,34 +454,53 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_ADD: {
-         /* Fuse tensor addition into convolution*/
-         struct rkt_operation *input_op_1 =
-            find_producer(subgraph, poperations[i].input_tensors[1]->index);
-         struct rkt_operation *input_op_2 =
+         /* Fuse tensor addition into a convolution.  The host must be
+          * whichever producer runs LAST in the task chain: its EW stream
+          * reads the other input's tensor from memory, so that tensor has
+          * to be computed already.  In resnet-style downsample blocks both
+          * inputs are produced inside the partition (main path and the 1x1
+          * skip) and the tflite order puts the skip conv after the main
+          * path -- fusing into the first one made the EW read garbage
+          * (resnet18 RE 2026-08-23; the vendor fuses into the 1x1 s2 skip
+          * convolutions, its tasks 8/13/18). */
+         struct rkt_operation *prod0 =
             find_producer(subgraph, poperations[i].input_tensors[0]->index);
+         struct rkt_operation *prod1 =
+            find_producer(subgraph, poperations[i].input_tensors[1]->index);
+         struct rkt_operation *host, *other_op;
+         const struct pipe_tensor *other;
 
-         assert(input_op_1);
-         assert(input_op_2);
+         assert(prod0 || prod1);
 
-         if (input_op_1 == NULL) {
-            /* Graph input */
-            input_op_2->add_tensor = poperations[i].input_tensors[1]->index;
+         if (!prod1 || (prod0 && prod0 > prod1)) {
+            host = prod0;
+            other_op = prod1;
+            other = poperations[i].input_tensors[1];
          } else {
-            input_op_1->addition_input = true;
-            input_op_2->add_tensor = input_op_1->output_index;
+            host = prod1;
+            other_op = prod0;
+            other = poperations[i].input_tensors[0];
          }
 
-         input_op_2->output_index = poperations[i].output_tensors[0]->index;
+         if (other_op == NULL) {
+            /* Graph input */
+            host->add_tensor = other->index;
+         } else {
+            other_op->addition_input = true;
+            host->add_tensor = other_op->output_index;
+         }
+
+         host->output_index = poperations[i].output_tensors[0]->index;
          /* The fused task requants into the ADD's output domain, not the
           * convolution's (mobilenet_v2 RE 2026-08-23: with the conv's old
           * zp/scale left here, OUT_CVT used zp 136 instead of the add
           * output's 133 and the whole residual sum came out shifted). */
-         input_op_2->output_zero_point =
+         host->output_zero_point =
             poperations[i].output_tensors[0]->zero_point;
-         input_op_2->output_scale = poperations[i].output_tensors[0]->scale;
-         input_op_2->addition_offset =
-            0x80 - poperations[i].input_tensors[1]->zero_point;
-         input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
+         host->output_scale = poperations[i].output_tensors[0]->scale;
+         host->addition_offset = 0x80 - other->zero_point;
+         host->addition_scale = other->scale;
+         host->addition_relu = poperations[i].add.relu;
 
          break;
       }
