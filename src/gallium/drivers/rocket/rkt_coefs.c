@@ -103,7 +103,11 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       unsigned slices = DIV_ROUND_UP(input_channels_real, 32);
       unsigned kgroups = DIV_ROUND_UP(geom_kernels, 16);
       unsigned rem_ic = input_channels_real % 32;
-      unsigned row_tail = input_channels_real <= 8
+      /* The 8-byte kernel row belongs to the packed-RGB (ARGB) first-layer
+       * mode only (probe-RGB byte-exact, Cin=3).  A plain conv with
+       * Cin=4..8 announces 16 bytes per kernel in WEIGHT_SIZE1
+       * (conv-tiny probes) and reads the rows at that stride. */
+      unsigned row_tail = input_channels_real <= 3
                              ? 8
                              : rem_ic ? MIN2(align(rem_ic, 16), 32) : 32;
       /* bytes of one kernel row across all ic slices */
