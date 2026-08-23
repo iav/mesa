@@ -590,10 +590,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
            rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
               task->output_offset);
-      emit_raw(regs, DPU_RDMA | 0x1, 0x503c,
-               task->output_surface_stride * 8 - 8);
+      /* The second-input tensor keeps full-height surfaces regardless of
+       * banding, so the EW surface stride spans the full tensor height
+       * even on a band task (vendor probe-ADDB: 0x6200 on both bands of a
+       * 56x56 add). */
+      unsigned ew_surf_stride =
+         operation->output_width * operation->output_height * 8;
+      emit_raw(regs, DPU_RDMA | 0x1, 0x503c, ew_surf_stride - 8);
       emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
-               task->output_surface_stride * 8);
+               ew_surf_stride);
    } else {
       EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG, DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE(1));
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0);
@@ -622,8 +627,19 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feat_mode_cfg);
    EMIT(REG_DPU_RDMA_RDMA_SRC_DMA_CFG, 0);
 
-   /* The vendor's fused-add tasks keep SURF_NOTCH at 0 like plain convs. */
-   EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
+   /* Banded fused-add tasks (vendor probe-ADDB, 2 bands of a 56x56x128
+    * 3x3): SURF_NOTCH = (H_full - H_band) * W * 8 -- the part of each
+    * full-height EW surface that lies outside this band, which the EW
+    * RDMA skips when hopping to the next surface.  Full-fit tasks get 0
+    * (H_band == H_full), matching the vendor's plain and single-task add
+    * convolutions. */
+   if (operation->add_tensor != -1) {
+      EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH,
+           (operation->output_height - task->output_height) *
+              operation->output_width * 8);
+   } else {
+      EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
+   }
 
    EMIT(REG_DPU_RDMA_RDMA_PAD_CFG, 0);
    EMIT(REG_DPU_RDMA_RDMA_WEIGHT,
