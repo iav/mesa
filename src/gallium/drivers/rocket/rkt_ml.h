@@ -109,6 +109,7 @@ struct rkt_operation {
    int addition_offset;
    float addition_scale;
    bool addition_relu;
+   bool relu;
 
    unsigned input_index;
    unsigned input_width;
@@ -145,6 +146,16 @@ struct rkt_ml_subgraph {
    struct util_dynarray operations; /* rkt_operation */
    struct util_dynarray tensors;    /* pipe_resource* */
 };
+
+/* RK3568 feature surfaces are padded to whole 32-byte CBUF entries: the
+ * per-surface pixel count is aligned to 4 (vendor: 7x7 maps use surface
+ * stride 52 everywhere -- CNA DMA_CON2, DPU DST_SURF_STRIDE, SURFACE_ADD;
+ * a 1x1 FC-shaped map keeps stride 1). */
+static inline unsigned
+rkt_surf_px(unsigned px)
+{
+   return px > 1 ? align(px, 4) : px;
+}
 
 bool
 rkt_ml_operation_supported(struct pipe_ml_device *pdevice, const struct pipe_ml_operation *operation);

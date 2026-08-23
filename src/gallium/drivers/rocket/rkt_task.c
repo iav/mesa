@@ -163,7 +163,7 @@ fill_task(struct rkt_ml_subgraph *subgraph,
       task->input_line_stride =
          calc_line_stride(operation->input_width) / FEATURE_ATOMIC_SIZE;
       task->input_surface_stride =
-         task->input_line_stride * task->input_height;
+         rkt_surf_px(task->input_line_stride * task->input_height);
    }
 
    if (task->input_width == 8 &&
@@ -175,6 +175,7 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    int output_line_stride = calc_line_stride(operation->output_width);
    task->output_surface_stride = output_line_stride * task->output_height;
    task->output_surface_stride /= FEATURE_ATOMIC_SIZE;
+   task->output_surface_stride = rkt_surf_px(task->output_surface_stride);
 
    if (task->input_channels_real == 1)
       task->input_data_entries = task->input_width * task->input_height;
@@ -209,7 +210,8 @@ fill_task(struct rkt_ml_subgraph *subgraph,
     * output surface size in 16-byte cells = Wout * Hout, i.e. equal to
     * output_surface_stride.  The previous *2 was an RK3588-era magic
     * multiplier (elements-vs-cells mismatch). */
-   task->surfaces_per_row = task->output_width * task->output_height;
+   task->surfaces_per_row =
+      rkt_surf_px(task->output_width * task->output_height);
    if (operation->depthwise)
       task->surfaces_per_row *= 2;
 }
