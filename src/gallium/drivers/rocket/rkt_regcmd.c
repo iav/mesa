@@ -273,8 +273,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_CNA_FEATURE_DATA_ADDR,
         rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
            task->input_offset +
-           task->channel_group * operation->input_width *
-              operation->input_height * 32);
+           task->channel_group *
+              rkt_surf_px(operation->input_width * operation->input_height) *
+              32);
    EMIT(REG_CNA_FC_CON2, 0);
    /* DMA_CON0: FETCH_PIXEL_LEN (bits 15:8) is the per-surface feature fetch
     * length. Mesa previously omitted this field, leaving it 0 which causes
@@ -415,8 +416,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
            task->output_offset +
-           task->channel_group * operation->output_width *
-              operation->output_height * 32);
+           task->channel_group *
+              rkt_surf_px(operation->output_width * operation->output_height) *
+              32);
    /* TEST (iav RE, 2026-08-21): the vendor stream carries output_width *
     * output_height / 2 here, half of what mesa emits, on all 44 convolution
     * tasks of mobilenet_v1 (checked against the full output tensor, not the
@@ -464,12 +466,33 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
    }
-   EMIT(REG_DPU_BN_CFG,
-        DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
-           DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
+   if (operation->relu) {
+      /* Fused relu/relu6 the vendor way (mobilenet_v1 t0: BN_CFG 0x92,
+       * RELUX_CMP 6/(si*sw)): the BN stage clamps the accumulator to
+       * [0, CMP] before the EW and OUT_CVT stages.  Output saturation
+       * alone only implements the lower clamp when the output zero point
+       * is 0 -- on models where the relu output is quantized with a
+       * nonzero zero point the negative accumulator survived saturation
+       * (resnet18 probes, RE 2026-08-23).  CMP is the largest value the
+       * u8 output can express, which on (0,6)-quantized tensors equals
+       * the vendor's relu6 bound; rounded up so u8 saturation still
+       * performs the exact upper clamp. */
+      float acc_max = (255 - task->output_zero_point) * task->output_scale /
+                      (task->input_scale * task->weights_scale);
+      EMIT(REG_DPU_BN_CFG,
+           DPU_BN_CFG_BN_RELUX_EN(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
+              DPU_BN_CFG_BN_ALU_BYPASS(1));
+      EMIT(REG_DPU_BN_RELUX_CMP_VALUE,
+           (uint32_t)MIN2(ceilf(acc_max), 2147483520.0f));
+   } else {
+      EMIT(REG_DPU_BN_CFG,
+           DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
+              DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
+   }
    EMIT(REG_DPU_BN_ALU_CFG, 0);
    EMIT(REG_DPU_BN_MUL_CFG, 0);
-   EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
+   if (!operation->relu)
+      EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
 
    if (operation->add_tensor != -1) {
       /* RK3568 fused residual add (vendor resnet18 capture 2026-08-23,
@@ -595,7 +618,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * even on a band task (vendor probe-ADDB: 0x6200 on both bands of a
        * 56x56 add). */
       unsigned ew_surf_stride =
-         operation->output_width * operation->output_height * 8;
+         rkt_surf_px(operation->output_width * operation->output_height) * 8;
       emit_raw(regs, DPU_RDMA | 0x1, 0x503c, ew_surf_stride - 8);
       emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
                ew_surf_stride);
@@ -634,9 +657,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * (H_band == H_full), matching the vendor's plain and single-task add
     * convolutions. */
    if (operation->add_tensor != -1) {
+      /* The part of each EW surface this task does not consume: the rows
+       * outside the band plus the surface alignment padding (vendor 7x7
+       * full-fit add: notch 24 = (52-49)*8; banded 56x56: 11200). */
       EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH,
-           (operation->output_height - task->output_height) *
-              operation->output_width * 8);
+           rkt_surf_px(operation->output_width * operation->output_height) *
+                 8 -
+              task->output_width * task->output_height * 8);
    } else {
       EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
    }

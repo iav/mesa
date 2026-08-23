@@ -82,7 +82,7 @@ calc_raw_output_size(struct rkt_operation *operation)
       DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) * 2;
    unsigned output_channels_2 = FEATURE_ATOMIC_SIZE;
 
-   return operation->output_width * operation->output_height *
+   return rkt_surf_px(operation->output_width * operation->output_height) *
           output_channels_1 * output_channels_2;
 }
 
@@ -173,6 +173,7 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->tasks = UTIL_DYNARRAY_INIT;
 
    operation->depthwise = rkt_is_depthwise(poperation);
+   operation->relu = poperation->conv.relu;
    operation->padding_top = poperation->conv.padding_top;
    operation->padding_bottom = poperation->conv.padding_bottom;
    operation->padding_left = poperation->conv.padding_left;
@@ -516,8 +517,9 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
       unsigned input_channels_1 =
          DIV_ROUND_UP(operation->input_channels, FEATURE_ATOMIC_SIZE) * 2;
       unsigned input_channels_2 = FEATURE_ATOMIC_SIZE;
-      unsigned input_size = operation->input_width * operation->input_height *
-                            input_channels_1 * input_channels_2;
+      unsigned input_size =
+         rkt_surf_px(operation->input_width * operation->input_height) *
+         input_channels_1 * input_channels_2;
 
       create_tensor(subgraph, operation->input_index, input_size);
    }
@@ -615,6 +617,9 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
              * carrying 8 channels, planar 8-channel surfaces of stride
              * W*H*8; all CNA/DPU strides are in 8-byte units. */
             unsigned n = 0;
+            unsigned surf_pad =
+               rkt_surf_px(input_width * input_height) -
+               input_width * input_height;
             for (int u = 0; u < DIV_ROUND_UP(input_channels, 8); u++) {
                for (int x = 0; x < input_width; x++) {
                   for (int y = 0; y < input_height; y++) {
@@ -627,6 +632,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                      }
                   }
                }
+               for (unsigned p = 0; p < surf_pad * 8; p++)
+                  map[n++] = zero_point - 0x80;
             }
          }
 
@@ -653,9 +660,16 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
 
       in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
 
-      if (operation->add_tensor != -1)
+      if (operation->add_tensor != -1) {
          in_bo_handles[1] =
             rkt_get_tensor(subgraph, operation->add_tensor)->handle;
+         /* A duplicated handle in the job's BO list makes the scheduler
+          * wedge silently (same failure mode as one BO in both the in and
+          * out lists) -- happens when the convolution input doubles as the
+          * second add input (add(x, conv(x))). */
+         if (in_bo_handles[1] == in_bo_handles[0])
+            num_inputs = 1;
+      }
 
       out_bo_handles[0] =
          rkt_get_tensor(subgraph, operation->output_index)->handle;
@@ -800,12 +814,13 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          uint8_t *raw = (uint8_t *)output_in;
          unsigned rows = operation->output_width;   /* dims[1] */
          unsigned cols = operation->output_height;  /* dims[2] */
+         unsigned surf = rkt_surf_px(rows * cols) * 8;
          for (int oc = 0; oc < operation->output_channels; oc++) {
             unsigned g = oc / 8, c = oc % 8;
             for (unsigned y = 0; y < rows; y++) {
                for (unsigned x = 0; x < cols; x++) {
                   output_out[y][x][oc] =
-                     raw[g * rows * cols * 8 + (y * cols + x) * 8 + c] + 0x80;
+                     raw[g * surf + (y * cols + x) * 8 + c] + 0x80;
                }
             }
          }
