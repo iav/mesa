@@ -203,6 +203,54 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
 }
 
+/* Average pooling as a depthwise convolution: every weight is q=255 with
+ * scale 1/(fw*fh*255) and zero point 0, so each tap contributes exactly
+ * 1/(fw*fh) -- the regular requantization pipeline does the rest.  The
+ * packed weight bytes come out as 0x7f, matching the vendor stream. */
+static void
+lower_pooling(struct rkt_ml_subgraph *subgraph,
+              const struct pipe_ml_operation *ppool,
+              struct rkt_operation *operation)
+{
+   unsigned fw = ppool->pooling.filter_width;
+   unsigned fh = ppool->pooling.filter_height;
+   unsigned channels = ppool->input_tensors[0]->dims[3];
+   struct pipe_ml_operation conv = {0};
+   struct pipe_tensor weight_tensor = {0};
+   struct pipe_tensor bias_tensor = {0};
+   uint8_t *wdata = malloc(fw * fh * channels);
+   int32_t *bdata = calloc(channels, sizeof(int32_t));
+
+   memset(wdata, 0xff, fw * fh * channels);
+
+   weight_tensor.dims[0] = 1;
+   weight_tensor.dims[1] = fh;
+   weight_tensor.dims[2] = fw;
+   weight_tensor.dims[3] = channels;
+   weight_tensor.scale = 1.0f / (fw * fh * 255);
+   weight_tensor.zero_point = 0;
+   weight_tensor.data = wdata;
+
+   bias_tensor.dims[3] = channels;
+   bias_tensor.data = (uint8_t *)bdata;
+
+   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+   conv.input_tensors = ppool->input_tensors;
+   conv.output_tensors = ppool->output_tensors;
+   conv.conv.weight_tensor = &weight_tensor;
+   conv.conv.bias_tensor = &bias_tensor;
+   conv.conv.stride_x = ppool->pooling.stride_x;
+   conv.conv.stride_y = ppool->pooling.stride_y;
+   conv.conv.depthwise = true;
+   conv.conv.dilation_width_factor = 1;
+   conv.conv.dilation_height_factor = 1;
+
+   lower_convolution(subgraph, &conv, operation);
+
+   free(wdata);
+   free(bdata);
+}
+
 static struct rkt_operation *
 find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
 {
@@ -245,6 +293,9 @@ count_tensors(const struct pipe_ml_operation *poperations,
          break;
       case PIPE_ML_OPERATION_TYPE_ADD:
          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
+         break;
+      case PIPE_ML_OPERATION_TYPE_POOLING:
+         /* lowered to a synthetic depthwise convolution; no extra tensors */
          break;
       default:
          DBG("poperation->type %d\n", poperation->type);
@@ -305,6 +356,22 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       supported = operation->input_tensors[0]->data == NULL &&
                   operation->input_tensors[1]->data == NULL;
       break;
+   case PIPE_ML_OPERATION_TYPE_POOLING:
+      /* Average pooling runs as a depthwise convolution with constant
+       * weights (the vendor does the same: mobilenet_v1 t49 is a 7x7/s7
+       * depthwise with an all-0x7f weight buffer).  Padding must be zero:
+       * with padding TFLite divides by the number of VALID elements at the
+       * edges, which a fixed-weight convolution cannot reproduce. */
+      supported = operation->pooling.type == PIPE_ML_POOLING_TYPE_AVG &&
+                  tensor_quantization_supported(operation->input_tensors[0]) &&
+                  tensor_quantization_supported(operation->output_tensors[0]) &&
+                  operation->pooling.filter_width <= 7 &&
+                  operation->pooling.filter_height <= 7 &&
+                  operation->pooling.padding_top == 0 &&
+                  operation->pooling.padding_bottom == 0 &&
+                  operation->pooling.padding_left == 0 &&
+                  operation->pooling.padding_right == 0;
+      break;
    default:
       supported = false;
    }
@@ -345,6 +412,10 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
       switch (poperations[i].type) {
       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
          lower_convolution(subgraph, &poperations[i], &operation);
+         util_dynarray_append(&subgraph->operations, operation);
+         break;
+      case PIPE_ML_OPERATION_TYPE_POOLING:
+         lower_pooling(subgraph, &poperations[i], &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_ADD: {
