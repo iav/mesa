@@ -12,4 +12,8 @@ void rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
                      const struct rkt_operation *operation,
                      struct util_dynarray *regs, unsigned task_num);
 
+void rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
+                         const struct rkt_operation *operation,
+                         struct util_dynarray *regs);
+
 #endif /* RKT_REGCMD_H */

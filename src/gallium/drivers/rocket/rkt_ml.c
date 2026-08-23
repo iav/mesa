@@ -86,9 +86,14 @@ calc_raw_output_size(struct rkt_operation *operation)
           output_channels_1 * output_channels_2;
 }
 
+/* Room reserved after an operation's streams for an appended PPU pool
+ * chunk (33 words, 128-byte aligned). */
+#define POOL_CHUNK_ROOM 384
+
 static void
 compile_operation(struct rkt_ml_subgraph *subgraph,
-                  struct rkt_operation *operation)
+                  struct rkt_operation *operation,
+                  struct rkt_operation *pool_op)
 {
    struct pipe_context *pcontext = subgraph->context;
    unsigned regcfg_total_size = 0;
@@ -96,6 +101,13 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
    struct pipe_transfer *transfer = NULL;
    unsigned num_tasks =
       util_dynarray_num_elements(&operation->tasks, struct split_task);
+
+   /* Pool operations compile as a chunk APPENDED to the previous
+    * operation's regcmd BO (pool_op below): the PC cannot fetch a PPU
+    * chunk from a foreign BO -- vendor-stream replay wedges with the
+    * chunk moved out, runs with it in place (RE-LOG Test 61); regular
+    * convolution streams jump across BOs fine. */
+   assert(!operation->is_pool);
 
    regcfgs = calloc(num_tasks, sizeof(struct util_dynarray));
 
@@ -107,6 +119,9 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
          util_dynarray_num_elements(&regcfgs[i], uint64_t) * sizeof(uint64_t);
       regcfg_total_size += align(size, 128);
    }
+
+   if (pool_op)
+      regcfg_total_size += POOL_CHUNK_ROOM;
 
    operation->regcmd = pipe_buffer_create(pcontext->screen, 0,
                                           PIPE_USAGE_DEFAULT, regcfg_total_size);
@@ -149,11 +164,35 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
       task->regcfg_addr =
          rkt_resource(operation->regcmd)->phys_addr + regcmd_offset;
 
-      if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
-         rkt_dump_buffer(regcmd, "regcmd", 0, i, regcmd_offset,
+      if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
+         static int dump_nr;
+         rkt_dump_buffer(regcmd, "regcmd", dump_nr++, i, regcmd_offset,
                          (size + 4) * sizeof(uint64_t));
+      }
 
       regcmd_offset += align(size * sizeof(uint64_t), 128);
+   }
+
+   if (pool_op) {
+      struct util_dynarray pregs = UTIL_DYNARRAY_INIT;
+      struct split_task *ptask =
+         util_dynarray_element(&pool_op->tasks, struct split_task, 0);
+
+      rkt_fill_ppu_regcmd(subgraph, pool_op, &pregs);
+
+      unsigned psize = util_dynarray_num_elements(&pregs, uint64_t);
+      assert(psize * sizeof(uint64_t) <= POOL_CHUNK_ROOM);
+      memcpy(regcmd + regcmd_offset, util_dynarray_begin(&pregs),
+             psize * sizeof(uint64_t));
+      ptask->regcfg_amount = psize;
+      ptask->regcfg_addr =
+         rkt_resource(operation->regcmd)->phys_addr + regcmd_offset;
+      if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
+         static int pool_dump_nr;
+         rkt_dump_buffer(regcmd, "poolcmd", pool_dump_nr++, 0, regcmd_offset,
+                         psize * sizeof(uint64_t));
+      }
+      util_dynarray_fini(&pregs);
    }
 
    pipe_buffer_unmap(pcontext, transfer);
@@ -251,6 +290,42 @@ lower_pooling(struct rkt_ml_subgraph *subgraph,
 
    free(wdata);
    free(bdata);
+}
+
+/* Max pooling on the PPU unit: no weights, no requantization -- just the
+ * geometry.  The operation compiles to a bare PPU/PPU_RDMA chunk (see
+ * rkt_fill_ppu_regcmd) linked into the PC chain after its producer. */
+static void
+lower_max_pooling(struct rkt_ml_subgraph *subgraph,
+                  const struct pipe_ml_operation *ppool,
+                  struct rkt_operation *operation)
+{
+   operation->tasks = UTIL_DYNARRAY_INIT;
+   operation->is_pool = true;
+
+   operation->input_index = ppool->input_tensors[0]->index;
+   operation->input_width = ppool->input_tensors[0]->dims[1];
+   operation->input_height = ppool->input_tensors[0]->dims[2];
+   operation->input_channels = ppool->input_tensors[0]->dims[3];
+   operation->input_zero_point = ppool->input_tensors[0]->zero_point;
+   operation->input_scale = ppool->input_tensors[0]->scale;
+
+   operation->output_index = ppool->output_tensors[0]->index;
+   operation->output_width = ppool->output_tensors[0]->dims[1];
+   operation->output_height = ppool->output_tensors[0]->dims[2];
+   operation->output_channels = ppool->output_tensors[0]->dims[3];
+   operation->output_zero_point = ppool->output_tensors[0]->zero_point;
+   operation->output_scale = ppool->output_tensors[0]->scale;
+
+   operation->weights_width = ppool->pooling.filter_width;
+   operation->weights_height = ppool->pooling.filter_height;
+   operation->stride = ppool->pooling.stride_x;
+   operation->padding_top = ppool->pooling.padding_top;
+   operation->padding_bottom = ppool->pooling.padding_bottom;
+   operation->padding_left = ppool->pooling.padding_left;
+   operation->padding_right = ppool->pooling.padding_right;
+
+   operation->add_tensor = -1;
 }
 
 static struct rkt_operation *
@@ -373,6 +448,41 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                   operation->pooling.padding_bottom == 0 &&
                   operation->pooling.padding_left == 0 &&
                   operation->pooling.padding_right == 0;
+      /* Max pooling runs on the PPU unit (vendor resnet18 task 1;
+       * RE-LOG Tests 60-61).  Quantization must pass through unchanged:
+       * the PPU chunk carries no requantization stage.  RKT_NO_PPU=1
+       * falls back to the CPU. */
+      supported |= getenv("RKT_NO_PPU") == NULL &&
+                   operation->pooling.type == PIPE_ML_POOLING_TYPE_MAX &&
+                   tensor_quantization_supported(operation->input_tensors[0]) &&
+                   tensor_quantization_supported(operation->output_tensors[0]) &&
+                   operation->input_tensors[0]->scale ==
+                      operation->output_tensors[0]->scale &&
+                   operation->input_tensors[0]->zero_point ==
+                      operation->output_tensors[0]->zero_point &&
+                   operation->pooling.filter_width <= 8 &&
+                   operation->pooling.filter_height <= 8 &&
+                   operation->pooling.stride_x == operation->pooling.stride_y &&
+                   operation->pooling.stride_x >= 1 &&
+                   operation->pooling.stride_x <= 8 &&
+                   operation->pooling.padding_top <= 15 &&
+                   operation->pooling.padding_bottom <= 15 &&
+                   operation->pooling.padding_left <= 15 &&
+                   operation->pooling.padding_right <= 15 &&
+                   /* every window must fit input+padding or the PPU
+                    * starves and the chain wedges */
+                   (operation->output_tensors[0]->dims[1] - 1) *
+                         operation->pooling.stride_x +
+                         operation->pooling.filter_width <=
+                      operation->input_tensors[0]->dims[1] +
+                         operation->pooling.padding_left +
+                         operation->pooling.padding_right &&
+                   (operation->output_tensors[0]->dims[2] - 1) *
+                         operation->pooling.stride_y +
+                         operation->pooling.filter_height <=
+                      operation->input_tensors[0]->dims[2] +
+                         operation->pooling.padding_top +
+                         operation->pooling.padding_bottom;
       break;
    default:
       supported = false;
@@ -414,6 +524,19 @@ fused_add_pad(const struct pipe_ml_operation *poperations, unsigned count,
    return 0;
 }
 
+/* RKT_NO_CHAIN reverts to one job per operation -- except when the graph
+ * holds a PPU pool chunk, which only ever executes as a chain link. */
+static bool
+rkt_chain_disabled(struct rkt_ml_subgraph *subgraph)
+{
+   if (!getenv("RKT_NO_CHAIN"))
+      return false;
+   util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
+      if (op->is_pool)
+         return false;
+   return true;
+}
+
 struct pipe_ml_subgraph *
 rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                        const struct pipe_ml_operation *poperations,
@@ -451,7 +574,10 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING:
-         lower_pooling(subgraph, &poperations[i], &operation);
+         if (poperations[i].pooling.type == PIPE_ML_POOLING_TYPE_MAX)
+            lower_max_pooling(subgraph, &poperations[i], &operation);
+         else
+            lower_pooling(subgraph, &poperations[i], &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_ADD: {
@@ -536,11 +662,31 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                     calc_raw_output_size(operation));
    }
 
-   /* Compile */
-   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
-                          operation) {
-      rkt_split_tasks(subgraph, operation);
-      compile_operation(subgraph, operation);
+   /* Compile.  A pool operation's PPU chunk is emitted into the PREVIOUS
+    * operation's regcmd BO (the PC cannot fetch it from a foreign BO),
+    * so it is handled while compiling that operation. */
+   {
+      unsigned n = util_dynarray_num_elements(&subgraph->operations,
+                                              struct rkt_operation);
+      for (unsigned i = 0; i < n; i++) {
+         struct rkt_operation *operation = util_dynarray_element(
+            &subgraph->operations, struct rkt_operation, i);
+         struct rkt_operation *pool = NULL;
+
+         if (operation->is_pool)
+            continue;
+         if (i + 1 < n) {
+            struct rkt_operation *next = util_dynarray_element(
+               &subgraph->operations, struct rkt_operation, i + 1);
+            if (next->is_pool) {
+               struct split_task task = {0};
+               util_dynarray_append(&next->tasks, task);
+               pool = next;
+            }
+         }
+         rkt_split_tasks(subgraph, operation);
+         compile_operation(subgraph, operation, pool);
+      }
    }
 
    /* Link every operation's last regcmd stream to the next operation's
@@ -548,7 +694,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
     * tasks inside an operation: the whole graph then runs as one PC task
     * chain in a single kernel job (one IRQ+fence round trip instead of
     * one per operation, ~0.2 ms each on RK3568). */
-   if (!getenv("RKT_NO_CHAIN")) {
+   if (!rkt_chain_disabled(subgraph)) {
       unsigned num_ops = util_dynarray_num_elements(&subgraph->operations,
                                                     struct rkt_operation);
       for (unsigned i = 0; i + 1 < num_ops; i++) {
@@ -561,11 +707,18 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             util_dynarray_num_elements(&op->tasks, struct split_task) - 1);
          struct split_task *first =
             util_dynarray_element(&next->tasks, struct split_task, 0);
+         /* A pool operation's chunk lives in the PREVIOUS operation's
+          * regcmd BO (it has none of its own). */
+         struct pipe_resource *chunk_bo =
+            op->is_pool ? util_dynarray_element(&subgraph->operations,
+                                                struct rkt_operation, i - 1)
+                             ->regcmd
+                        : op->regcmd;
          struct pipe_transfer *xfer = NULL;
          uint64_t *words =
-            pipe_buffer_map(subgraph->context, op->regcmd, PIPE_MAP_READ_WRITE, &xfer);
+            pipe_buffer_map(subgraph->context, chunk_bo, PIPE_MAP_READ_WRITE, &xfer);
          unsigned base = (last->regcfg_addr -
-                          rkt_resource(op->regcmd)->phys_addr) /
+                          rkt_resource(chunk_bo)->phys_addr) /
                          sizeof(uint64_t);
          uint64_t *tail = words + base + last->regcfg_amount;
 
@@ -690,15 +843,30 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
     * both read and written inside the job, and a BO repeated across the
     * two lists wedges the scheduler -- they are covered by the out list
     * entry alone. */
-   if (!getenv("RKT_NO_CHAIN")) {
+   if (!rkt_chain_disabled(subgraph)) {
       unsigned num_ops = util_dynarray_num_elements(&subgraph->operations,
                                                     struct rkt_operation);
       unsigned total_tasks = 0;
+      /* PPU pool chunks are real tasks: the vendor's task table lists
+       * them with enable_mask 0x60 and int_mask 0xc00 (probe-MP task 2),
+       * and TASK_NUMBER counts them -- leaving them out desynchronizes
+       * the PC task pipeline and the PPU core never starts. */
       util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
          total_tasks +=
             util_dynarray_num_elements(&op->tasks, struct split_task);
 
+      /* One interrupt per job, the last task's (vendor scheme: the PC
+       * applies per-task masks from the descriptor array). */
+      struct rkt_operation *last_op = util_dynarray_element(
+         &subgraph->operations, struct rkt_operation, num_ops - 1);
+      uint32_t pool_int_mask =
+         getenv("RKT_POOL_INT_MASK")
+            ? strtol(getenv("RKT_POOL_INT_MASK"), NULL, 0)
+            : 0xc00;
+      uint32_t last_int_mask = last_op->is_pool ? pool_int_mask : 0x300;
+
       struct drm_rocket_task *tasks = calloc(total_tasks, sizeof(*tasks));
+      bool *task_is_pool = calloc(total_tasks, sizeof(bool));
       uint32_t *in_bo_handles = calloc(num_ops * 2, sizeof(uint32_t));
       uint32_t *out_bo_handles = calloc(num_ops, sizeof(uint32_t));
       unsigned num_inputs = 0, num_outputs = 0, ti = 0;
@@ -708,6 +876,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          util_dynarray_foreach (&op->tasks, struct split_task, task) {
             tasks[ti].regcmd = task->regcfg_addr;
             tasks[ti].regcmd_count = task->regcfg_amount;
+            task_is_pool[ti] = op->is_pool;
             ti++;
          }
 
@@ -748,15 +917,19 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       for (unsigned k = 0; k < total_tasks; k++) {
          d[k].flags = 0;
          d[k].op_idx = k + 1;
-         d[k].enable_mask = 0x1f;
-         d[k].int_mask = 0x300;
+         d[k].enable_mask = task_is_pool[k] ? 0x60 : 0x1f;
+         d[k].int_mask = task_is_pool[k] ? 0xc00 : 0x300;
          d[k].int_clear = 0x1ffff;
          d[k].int_status = 0;
-         d[k].regcfg_amount = tasks[k].regcmd_count - 1;
+         /* The vendor descriptor amount excludes the 4-word PC tail
+          * (conv chunks: 133 of 137 words, pool: 29 of 33); the PC adds
+          * RKNPU_PC_DATA_EXTRA_AMOUNT itself when it walks the array. */
+         d[k].regcfg_amount = tasks[k].regcmd_count - 4;
          d[k].regcfg_offset = 0;
          d[k].regcmd_addr = tasks[k].regcmd;
       }
       pipe_buffer_unmap(pcontext, xfer);
+      free(task_is_pool);
       util_dynarray_element(&subgraph->operations, struct rkt_operation, 0)
          ->task_descs = descs_rsc;
 
@@ -769,6 +942,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       job.tasks = (uint64_t)(uintptr_t)tasks;
       job.task_count = total_tasks;
       job.task_desc_addr = rkt_resource(descs_rsc)->phys_addr;
+      job.last_int_mask = last_int_mask;
       util_dynarray_append(&jobs, job);
    } else
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
