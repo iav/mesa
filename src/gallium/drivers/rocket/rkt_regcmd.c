@@ -77,7 +77,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * reuse bit). */
       struct split_task *prev = util_dynarray_element(
          &operation->tasks, struct split_task, task_num - 1);
-      if (prev->channel_group == task->channel_group)
+      /* TEST (iav RE 2026-08-23): RKT_NO_WREUSE=1 disables the CBUF weight
+       * reuse bit on follow-up band tasks — probing the band-2 constant
+       * output on small-weight convs (mobilenet_v2 op2, 512 B). */
+      if (prev->channel_group == task->channel_group &&
+          !getenv("RKT_NO_WREUSE"))
          con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
    }
 
@@ -135,11 +139,26 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * Mesa's kernels/32 - 1 underflows to 0xff on depthwise, where kernels is
     * 1 -- and depthwise is exactly what stalls after CNA. */
    /* FC-shaped (1x1 spatial input): the vendor uses FEATURE_GRAINS=1. */
-   EMIT(REG_CNA_CONV_CON2,
-        CNA_CONV_CON2_FEATURE_GRAINS(
-           (task->input_width == 1 && task->input_height == 1)
-              ? 1
-              : task->stride_y + task->weights_height));
+   /* FEATURE_GRAINS grows on narrow outputs (mobilenet_v2 RE 2026-08-23):
+    * with the plain stride+kh value a 7x7 conv starts the MAC before the
+    * first weight group is in CBUF and oc0-15 read garbage (op49, run-to-
+    * run unstable).  The vendor's 51 mobilenet_v1 tasks all match
+    *   stride_y + kh + stride_y * ((Wout < 28) + (Wout < 14))
+    * (1x1: 2/3/4 for W>=28/14/7; dw s1: 4/5/6; dw s2: 5/7/9), except the
+    * Wout==1 cases (FC=1, avgpool=kh) which keep their special values.
+    * RKT_GRAINS overrides for probing. */
+   unsigned grains;
+   if (task->input_width == 1 && task->input_height == 1)
+      grains = 1;
+   else {
+      grains = task->stride_y + task->weights_height;
+      if (task->output_width > 1 && !getenv("RKT_GRAINS_OLD"))
+         grains += task->stride_y * ((task->output_width < 28 ? 1 : 0) +
+                                     (task->output_width < 14 ? 1 : 0));
+   }
+   if (getenv("RKT_GRAINS"))
+      grains = atoi(getenv("RKT_GRAINS"));
+   EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(grains));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
    /* CONV_CON4: RGB_BYTELENGTH per TRM (page 418). Required to be non-zero
@@ -453,129 +472,33 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
 
    if (operation->add_tensor != -1) {
-      EMIT(REG_DPU_EW_CFG,
-           DPU_EW_CFG_EW_CVT_TYPE(1) | DPU_EW_CFG_EW_DATA_MODE(1) |
-              DPU_EW_CFG_EDATA_SIZE(1) | DPU_EW_CFG_EW_ALU_ALGO(2) |
-              DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_LUT_BYPASS(1) |
-              DPU_EW_CFG_EW_OP_SRC(1));
-
-      /* See http://nvdla.org/hw/v1/ias/precision.html#element-wise */
+      /* RK3568 fused residual add (vendor resnet18 capture 2026-08-23,
+       * tasks 3/5/8/10/13/15/18/20): EW_CFG is the raw vendor word
+       * 0x900000d0 and ERDMA_CFG is raw 0x40000000 (neither decodes with
+       * the RK3588 bitfields).  The EW RDMA reads the second input from its
+       * 8ch-planar surfaces and the EW converter maps it into the
+       * accumulator domain:
+       *   x2' = (x2_s8 + (0x80 - zp2)) * scale >> shift,
+       *   scale / 2^shift = s2 / (si * sw)
+       * -- the vendor's task 3 encodes that ratio (366.0) as 23423 >> 6
+       * with the same 15-bit mantissa rule OUT_CVT uses.  OUT_CVT then
+       * finishes with the usual conv_scale = si*sw/so for the sum. */
+      /* The vendor word has EW_RELU_BYPASS (bit 9) clear because resnet18
+       * fuses conv+add+RELU; mobilenet_v2's residual adds are linear, so
+       * bypass the EW relu (a fused relu after add would still be enforced
+       * by the u8 saturation when the output zero point is 0). */
+      emit_raw(regs, DPU | 0x1, REG_DPU_EW_CFG, 0x900000d0 | (1 << 9));
       EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, operation->addition_offset);
 
-      float add_scale = 0.0;
-      if (fabs(operation->addition_scale - 0.090192) < 0.00001) {
-         add_scale = 299.671889248;
-      } else if (fabs(operation->addition_scale - 0.399250) < 0.00001) {
-         add_scale = 1326.499209406;
-      } else if (fabs(operation->addition_scale - 0.364902) < 0.00001) {
-         add_scale = 780.34375;
-      } else if (fabs(operation->addition_scale - 0.422037) < 0.00001) {
-         add_scale = 715.5625;
-      } else if (fabs(operation->addition_scale - 0.213016) < 0.00001) {
-         add_scale = 564.6875;
-      } else if (fabs(operation->addition_scale - 0.244231) < 0.00001) {
-         add_scale = 499.796875;
-      } else if (fabs(operation->addition_scale - 0.283416) < 0.00001) {
-         add_scale = 488.203125;
-      } else if (fabs(operation->addition_scale - 0.171151) < 0.00001) {
-         add_scale = 602.90625;
-      } else if (fabs(operation->addition_scale - 0.164588) < 0.00001) {
-         add_scale = 271.921875;
-      } else if (fabs(operation->addition_scale - 0.204098) < 0.00001) {
-         add_scale = 262.90625;
-      } else if (fabs(operation->addition_scale - 0.116532) < 0.00001) {
-         add_scale = 450.140625;
-      } else if (fabs(operation->addition_scale - 0.134499) < 0.00001) {
-         add_scale = 212.1953125;
-      } else if (fabs(operation->addition_scale - 0.220141) < 0.00001) {
-         add_scale = 368.28125;
-      } else if (fabs(operation->addition_scale - 0.094560) < 0.00001) {
-         add_scale = 416.421875;
-      } else if (fabs(operation->addition_scale - 0.093230) < 0.00001) {
-         add_scale = 305.421875;
-      } else if (fabs(operation->addition_scale - 0.100618) < 0.00001) {
-         add_scale = 313.671875;
-      } else {
-         add_scale = 0.0;
-      }
-
-      uint32_t add_scale_bits = fui(add_scale);
-      /* Taken from
-       * https://github.com/pytorch/QNNPACK/blob/master/src/qnnpack/requantization.h#L130
-       */
-      unsigned add_shift = 127 + 31 - 32 - (add_scale_bits >> 23) + 16;
-
-      unsigned scale = ((add_scale_bits >> 9) & 0x7fff);
-      if (scale < 1 << 14)
-         scale |= 1 << 14;
-
+      float ew_scale_f = operation->addition_scale /
+                         (task->input_scale * task->weights_scale);
+      uint32_t esb = fui(ew_scale_f);
+      unsigned eshift = 127 + 14 - (esb >> 23);
+      unsigned escale = ((esb >> 9) & 0x7fff) | (1 << 14);
       EMIT(REG_DPU_EW_CVT_SCALE_VALUE,
-           DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SHIFT(add_shift - 1) |
-              DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(scale));
-
+           DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SHIFT(eshift) |
+              DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(escale));
       EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0x0);
-
-      if (fabs(operation->addition_scale - 0.213016) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x4);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(25914));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.244231) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x1);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(28927));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.283416) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x6);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(26050));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.171151) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0xfffffffd);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(28937));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.164588) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x1);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(24877));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.204098) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x0);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(23272));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.116532) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0xfffffff8);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(32292));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.134499) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0xfffffffb);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(24153));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.220141) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0xb);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(27655));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.094560) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x5);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(20432));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.093230) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0xffffffff);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(25449));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.100618) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, offset);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(16874));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(23));
-      } else if (fabs(operation->addition_scale - 0.422037) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x1);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(22559));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else if (fabs(operation->addition_scale - 0.364902) < 0.00001) {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x4);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(18589));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(24));
-      } else {
-         EMIT(REG_DPU_OUT_CVT_OFFSET, 0x6);
-         EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(27676));
-         EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(25));
-      }
    } else {
       EMIT(REG_DPU_EW_CFG,
            DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
@@ -584,11 +507,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, 0);
       EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
       EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
+   }
+
+   {
       EMIT(REG_DPU_OUT_CVT_OFFSET, offset);
 
       float conv_scale =
          (task->input_scale * task->weights_scale) / task->output_scale;
-      // DBG("conv_scale %f\n", conv_scale);
       uint32_t scale_bits = fui(conv_scale);
       /* Taken from
        * https://github.com/pytorch/QNNPACK/blob/master/src/qnnpack/requantization.h#L130
@@ -637,13 +562,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
         DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
 
-   if (operation->add_tensor != -1) {
-      EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-           rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
-              task->output_offset);
-   } else {
-      EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
-   }
+   /* The vendor's fused-add tasks keep SRC_BASE_ADDR at 0 -- the second
+    * input goes through the EW RDMA (EW_BASE_ADDR below). */
+   EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
 
    EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
    /* mesa uses the per-tensor bias-only BS stream: 4 bytes per channel. */
@@ -660,32 +581,29 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 1); /* bit0 = disable, as vendor */
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
 
-   unsigned ew_stride =
-      MAX2(operation->output_width * operation->output_height, 12);
-
    if (operation->add_tensor != -1) {
-      EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG,
-           DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE(1) |
-              DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE(1));
-      unsigned ew_base_offset =
-         operation->output_width * operation->output_height * ATOMIC_K_SIZE;
+      /* Vendor resnet18 add tasks: ERDMA_CFG raw 0x40000000; EW base points
+       * straight at the second input's 8ch-planar tensor (+ band offset);
+       * 0x503c (EW line stride) = surf stride - 8 and EW_SURF_STRIDE =
+       * Wout*Hout*8, both in raw bytes (t3: 0x61f8 / 0x6200). */
+      emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000000);
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
            rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
-              task->output_offset + ew_base_offset);
-      EMIT(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
-           DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE(ew_stride));
+              task->output_offset);
+      emit_raw(regs, DPU_RDMA | 0x1, 0x503c,
+               task->output_surface_stride * 8 - 8);
+      emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
+               task->output_surface_stride * 8);
    } else {
       EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG, DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE(1));
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0);
+      emit_raw(regs, DPU_RDMA | 0x1, 0x503c, 0);
       EMIT(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, 0);
    }
 
    uint32_t rdma_feat_mode_cfg = 0x0;
 
-   if (operation->add_tensor != -1) {
-      rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
-                            DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE(5);
-   } else {
+   {
       /* RK3568 vendor requant (RE 2026-08-22): the vendor runs every conv task
        * with 0x4000/0x4006 here -- BURST_LEN=8, MRDMA_DISABLE clear.  With the
        * three-operand BRDMA stream (DATA_USE=7) the old BURST_LEN=15 |
@@ -704,32 +622,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feat_mode_cfg);
    EMIT(REG_DPU_RDMA_RDMA_SRC_DMA_CFG, 0);
 
-   unsigned surf_notch =
-      ew_stride +
-      task->output_width * (operation->output_height - task->output_height);
-
-   if (operation->input_width == 3) {
-      surf_notch = 15;
-   }
-
-   if (operation->add_tensor != -1) {
-      EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH,
-           DPU_RDMA_RDMA_SURF_NOTCH_SURF_NOTCH_ADDR(surf_notch));
-   } else {
-      EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
-   }
+   /* The vendor's fused-add tasks keep SURF_NOTCH at 0 like plain convs. */
+   EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
 
    EMIT(REG_DPU_RDMA_RDMA_PAD_CFG, 0);
    EMIT(REG_DPU_RDMA_RDMA_WEIGHT,
         DPU_RDMA_RDMA_WEIGHT_E_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_N_WEIGHT(1) |
            DPU_RDMA_RDMA_WEIGHT_B_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_M_WEIGHT(1));
 
-   if (operation->add_tensor != -1) {
-      EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH,
-           DPU_RDMA_RDMA_EW_SURF_NOTCH_EW_SURF_NOTCH(surf_notch));
-   } else {
-      EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0x0);
-   }
+   EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0x0);
 
    if (num_tasks == 1)
       util_dynarray_append_typed(regs, uint64_t, 0x0);
