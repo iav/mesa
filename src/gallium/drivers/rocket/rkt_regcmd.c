@@ -706,3 +706,100 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
     */
    fill_first_regcmd(subgraph, operation, regs, task_num);
 }
+
+/* RK3568 PPU max-pool chunk (RE 2026-08-23, vendor resnet18 task 1 /
+ * probe-MP): a 29-word PPU + PPU_RDMA register block finished with its
+ * own PC tail whose broadcast starts units 5 and 6 (OP_EN 0x60).  The
+ * chunk is linked into the PC chain right after the producer's stream;
+ * the PPU input is the producer's output surface in memory.  Word order
+ * matches the vendor stream exactly. */
+#define PPU_TARGET      0x4001ull
+#define PPU_RDMA_TARGET 0x8001ull
+#define PPU_WORD(tgt, val, reg)                                             \
+   util_dynarray_append_typed(                                              \
+      regs, uint64_t,                                                       \
+      ((uint64_t)(tgt) << 48) | (((uint64_t)(val) & 0xffffffff) << 16) |    \
+         (reg))
+
+void
+rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
+                    const struct rkt_operation *operation,
+                    struct util_dynarray *regs)
+{
+   unsigned in_w = operation->input_width;
+   unsigned in_h = operation->input_height;
+   unsigned channels = operation->input_channels;
+   unsigned out_w = operation->output_width;
+   unsigned out_h = operation->output_height;
+   uint32_t src_addr =
+      rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
+   uint32_t dst_addr =
+      rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
+   unsigned in_surf = rkt_surf_px(in_w * in_h) * 8;
+   unsigned out_surf = rkt_surf_px(out_w * out_h) * 8;
+
+   PPU_WORD(PPU_TARGET, 0xe, 0x6004);      /* S_POINTER */
+   PPU_WORD(PPU_RDMA_TARGET, 0xe, 0x7004); /* RDMA_S_POINTER */
+   PPU_WORD(PPU_TARGET, in_w - 1, 0x600c);
+   PPU_WORD(PPU_TARGET, in_h - 1, 0x6010);
+   PPU_WORD(PPU_TARGET, channels - 1, 0x6014);
+   PPU_WORD(PPU_TARGET, out_w - 1, 0x6018);
+   PPU_WORD(PPU_TARGET, out_h - 1, 0x601c);
+   PPU_WORD(PPU_TARGET, channels - 1, 0x6020);
+   /* OPERATION_MODE_CFG, vendor-verbatim 0x11 (max pooling; the input
+    * still goes through PPU_RDMA -- RKT_PPU_MODE overrides for
+    * experiments). */
+   PPU_WORD(PPU_TARGET,
+            getenv("RKT_PPU_MODE") ? strtol(getenv("RKT_PPU_MODE"), NULL, 0)
+                                   : 0x11,
+            0x6024);
+   PPU_WORD(PPU_TARGET,
+            (operation->stride - 1) << 20 | (operation->stride - 1) << 16 |
+               (operation->weights_height - 1) << 8 |
+               (operation->weights_width - 1),
+            0x6034); /* POOLING_KERNEL_CFG */
+   PPU_WORD(PPU_TARGET, 0, 0x6038); /* RECIP_KERNEL_WIDTH (avg only) */
+   PPU_WORD(PPU_TARGET, 0, 0x603c); /* RECIP_KERNEL_HEIGHT */
+   /* POOLING_PADDING_CFG, [3:0] left [7:4] top [11:8] right [15:12]
+    * bottom (RE-LOG Test 61, replay bit-mapping): every pooling window
+    * must fall inside input+padding on BOTH axes or the PPU starves
+    * forever and the whole PC chain wedges -- that was the mp3s2 hang
+    * (TFLite SAME pads right/bottom, and we only programmed top/left). */
+   PPU_WORD(PPU_TARGET,
+            operation->padding_bottom << 12 | operation->padding_right << 8 |
+               operation->padding_top << 4 | operation->padding_left,
+            0x6040);
+   /* Padding value: -128 as 19-bit two's complement -- the minimum int8,
+    * neutral for max pooling of the shifted (u8 - 0x80) feature data. */
+   PPU_WORD(PPU_TARGET, 0x7ff80, 0x6044);
+   PPU_WORD(PPU_TARGET, 0x7ff80, 0x6048);
+   PPU_WORD(PPU_TARGET, 0x7ff80, 0x604c);
+   PPU_WORD(PPU_TARGET, 0x7ff80, 0x6050);
+   PPU_WORD(PPU_TARGET, dst_addr, 0x6070);  /* DST_BASE_ADDR */
+   PPU_WORD(PPU_TARGET, out_surf, 0x607c);  /* DST_SURF_STRIDE, bytes */
+   PPU_WORD(PPU_TARGET, out_surf, 0x6084);  /* DATA_FORMAT / INDEX_ADD */
+   PPU_WORD(PPU_TARGET, 0x3, 0x60dc);       /* MISC_CTRL burst */
+   PPU_WORD(PPU_RDMA_TARGET, in_w - 1, 0x700c);
+   PPU_WORD(PPU_RDMA_TARGET, in_h - 1, 0x7010);
+   PPU_WORD(PPU_RDMA_TARGET, channels - 1, 0x7014);
+   PPU_WORD(PPU_RDMA_TARGET, 0x1, 0x7018);
+   PPU_WORD(PPU_RDMA_TARGET, src_addr, 0x701c); /* SRC_BASE_ADDR */
+   PPU_WORD(PPU_RDMA_TARGET, in_w * 8, 0x7024); /* SRC_LINE_STRIDE */
+   PPU_WORD(PPU_RDMA_TARGET, in_surf, 0x7028);  /* SRC_SURF_STRIDE */
+   PPU_WORD(PPU_RDMA_TARGET, 0, 0x7030);        /* RDMA_DATA_FORMAT */
+
+   /* Experiment knob: explicit per-unit OP_ENABLE words before the tail
+    * (the conv units must start via the broadcast, but the PPU pair may
+    * need its own). */
+   if (getenv("RKT_PPU_UNITEN")) {
+      PPU_WORD(PPU_RDMA_TARGET, 0x1, 0x7008);
+      PPU_WORD(PPU_TARGET, 0x1, 0x6008);
+   }
+
+   /* PC tail: address/amount patched by the cross-operation chain; the
+    * broadcast starts PPU + PPU_RDMA (units 5 and 6). */
+   EMIT(REG_PC_BASE_ADDRESS, 0);
+   EMIT(REG_PC_REGISTER_AMOUNTS, 0);
+   util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
+   util_dynarray_append_typed(regs, uint64_t, 0x0081000000600008);
+}

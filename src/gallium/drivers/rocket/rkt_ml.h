@@ -111,6 +111,15 @@ struct rkt_operation {
    bool addition_relu;
    bool relu;
 
+   /* RK3568 PPU max pooling (RE 2026-08-23, vendor resnet18 task 1): the
+    * operation is a bare PPU/PPU_RDMA register chunk started with a
+    * broadcast OP_EN 0x60, linked into the graph's PC chain like any
+    * other stream but NOT counted as a task (the vendor's TASK_NUMBER
+    * only counts the 0x1f convolution chunks).  Reuses weights_width and
+    * weights_height for the pooling kernel, padding and stride fields
+    * for the rest. */
+   bool is_pool;
+
    unsigned input_index;
    unsigned input_width;
    unsigned input_height;
