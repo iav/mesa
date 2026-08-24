@@ -452,6 +452,28 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct 
    default:
       tensor->is_signed = false;
    }
+
+   /* An INT8 tensor is folded into the uint8 domain right here: q_u8 =
+    * q_i8 + 128 (bytewise XOR 0x80) with the zero point shifted by +128
+    * represents the exact same affine value, so the driver below keeps
+    * working in uint8 only.  Bias data is int32 in the accumulator
+    * domain and needs no change.  The is_signed flag stays set so that
+    * subgraph invoke/read_output fold the runtime buffers the same
+    * way. */
+   if (tf_tensor.type == kTfLiteInt8) {
+      tensor->zero_point += 128;
+      if (tensor->zero_points) {
+         const TfLiteAffineQuantization *quant =
+            (const TfLiteAffineQuantization *)tf_tensor.quantization.params;
+         for (int i = 0; i < quant->scale->size; i++)
+            tensor->zero_points[i] += 128;
+      }
+      if (tensor->data) {
+         uint8_t *bytes = tensor->data;
+         for (unsigned i = 0; i < tensor_data_size(tf_tensor); i++)
+            bytes[i] ^= 0x80;
+      }
+   }
 }
 
 static void

@@ -248,6 +248,20 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
    operation->weights_scale = poperation->conv.weight_tensor->scale;
 
+   /* Per-channel weight quantization (the vendor two-stage scheme): the
+    * layer-wide OUT_CVT runs off the LARGEST channel scale and the BS
+    * mul entries renormalize each channel to it (rkt_fill_biases). */
+   if (poperation->conv.weight_tensor->scales != NULL) {
+      unsigned nch = operation->depthwise
+                        ? poperation->conv.weight_tensor->dims[3]
+                        : poperation->conv.weight_tensor->dims[0];
+      float s_wmax = 0.0f;
+      for (unsigned c = 0; c < nch; c++)
+         s_wmax = MAX2(s_wmax, poperation->conv.weight_tensor->scales[c]);
+      operation->weights_scale = s_wmax;
+      operation->per_channel = true;
+   }
+
    operation->output_channels_pad = pad_channels;
    operation->weights = rkt_fill_weights(subgraph, poperation, pad_channels);
    operation->biases =
@@ -551,10 +565,29 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
       struct pipe_tensor *output_tensor = operation->output_tensors[0];
 
-      // Dilation and per-axis quantization not yet implemented
+      /* Per-axis quantization is supported for the WEIGHTS of a
+       * convolution (the vendor two-stage BS scheme: per-channel mul
+       * against max(scales) plus the layer OUT_CVT), as long as every
+       * channel shares one zero point (TFLite per-channel weights are
+       * symmetric, zp 0).  Bias scales are s_in * s_wc by construction
+       * and never enter the pipeline -- the bias DATA is already
+       * quantized with them.  Activations must stay per-tensor. */
+      bool weights_quant_ok = tensor_quantization_supported(weight_tensor);
+      if (!weights_quant_ok && weight_tensor->scales != NULL) {
+         unsigned nch = operation->conv.depthwise ? weight_tensor->dims[3]
+                                                  : weight_tensor->dims[0];
+         weights_quant_ok = true;
+         if (weight_tensor->zero_points != NULL)
+            for (unsigned c = 0; c < nch; c++)
+               weights_quant_ok &=
+                  weight_tensor->zero_points[c] == weight_tensor->zero_points[0];
+      }
+      bool bias_quant_ok = tensor_quantization_supported(bias_tensor) ||
+                           bias_tensor->scales != NULL;
+
+      // Dilation not yet implemented
       if (tensor_quantization_supported(input_tensor) &&
-          tensor_quantization_supported(weight_tensor) &&
-          tensor_quantization_supported(bias_tensor) &&
+          weights_quant_ok && bias_quant_ok &&
           tensor_quantization_supported(output_tensor) &&
           operation->conv.dilation_width_factor == 1 &&
           operation->conv.dilation_height_factor == 1)
@@ -1053,8 +1086,13 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
 
       struct rkt_resource *input_tensor =
          rkt_get_tensor(subgraph, operation->input_index);
+      /* INT8 user buffers are folded into the driver's uint8 domain
+       * bytewise (q_u8 = q_i8 XOR 0x80); the zero points were already
+       * shifted by +128 when the tensors were created. */
+      uint8_t fold = is_signed[i] ? 0x80 : 0;
       if (output_channels == 1 && input_channels == 1 &&
-          !operation->addition_input && (operation->add_tensor == -1)) {
+          !operation->addition_input && (operation->add_tensor == -1) &&
+          !fold) {
          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
                           pipe_buffer_size(input));
       } else {
@@ -1083,7 +1121,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                unsigned n = y * line;
                for (int x = 0; x < input_width; x++)
                   for (int c = 0; c < 3; c++)
-                     map[n++] = input_in[y][x][c];
+                     map[n++] = input_in[y][x][c] ^ fold;
                for (; n < (y + 1) * line;)
                   map[n++] = 0;
             }
@@ -1092,7 +1130,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             for (int y = 0; y < input_height; y++) {
                for (int x = 0; x < MAX2(input_width, FEATURE_ATOMIC_SIZE); x++) {
                   if (x < input_width)
-                     map[n++] = input_in[y][x][0];
+                     map[n++] = input_in[y][x][0] ^ fold;
                   else
                      map[n++] = zero_point;
                }
@@ -1112,7 +1150,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                      for (int c = 0; c < 8; c++) {
                         unsigned input_channel = c + u * 8;
                         if (input_channel < input_channels)
-                           map[n++] = input_in[y][x][input_channel] - 0x80;
+                           map[n++] = (input_in[y][x][input_channel] ^ fold) -
+                                      0x80;
                         else
                            map[n++] = zero_point - 0x80;
                      }
@@ -1423,12 +1462,16 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          unsigned rows = out_h;   /* memory rows, dims[1] */
          unsigned cols = out_w;   /* contiguous row length, dims[2] */
          unsigned surf = rkt_surf_px(rows * cols) * 8;
+         /* An INT8 user buffer wants q_i8 = q_u8 XOR 0x80 (the driver
+          * domain is uint8, see subgraph_invoke). */
+         uint8_t fold = is_signed[i] ? 0x80 : 0;
          for (int oc = 0; oc < out_c; oc++) {
             unsigned g = oc / 8, c = oc % 8;
             for (unsigned y = 0; y < rows; y++) {
                for (unsigned x = 0; x < cols; x++) {
                   output_out[y][x][oc] =
-                     raw[g * surf + (y * cols + x) * 8 + c] + 0x80;
+                     (uint8_t)(raw[g * surf + (y * cols + x) * 8 + c] + 0x80) ^
+                     fold;
                }
             }
          }

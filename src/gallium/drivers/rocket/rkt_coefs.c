@@ -5,6 +5,7 @@
 
 #include "util/u_inlines.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -313,9 +314,18 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
     *          whole conv_scale lives in OUT_CVT_SCALE/SHIFT as the vendor does.
     * Stream length follows the padded channel count the RDMA fetches. */
    unsigned padded_channels = align(output_channels, 32);
-   bool bias_only_stream = true; /* per-tensor scheme (vendor probe-D2) */
+   /* Per-tensor quantization uses the vendor's bias-only stream (probe-
+    * D2); per-channel weight scales need the full triple, with mul
+    * renormalizing every channel to max(scales) (shift fixed at 14). */
+   const float *wscales = poperation->conv.weight_tensor->scales;
+   bool bias_only_stream = wscales == NULL;
    unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
+   float s_wmax = 0.0f;
    uint8_t *stream;
+
+   if (wscales != NULL)
+      for (unsigned c = 0; c < output_channels; c++)
+         s_wmax = MAX2(s_wmax, wscales[c]);
 
    *truncate_bits = 0;
 
@@ -355,7 +365,10 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
          bias32[j] = biases_in[oc] - corr;
          /* hardware ADDS ow*sum(x): ow = 0x80 - wzp (Test 42) */
          ow16[j] = 0x80 - weight_zero_point;
-         mul16[j] = 1 << 14;
+         /* mul = round(2^14 * s_wc / s_wmax) -- renormalize the channel
+          * to the layer scale the OUT_CVT stage runs off (vendor BS
+          * model, RE 2026-08-22). */
+         mul16[j] = (uint16_t)lrintf((wscales[oc] / s_wmax) * (1 << 14));
          if (getenv("RKT_MULSH"))
             mul16[j] = 1 << (14 - atoi(getenv("RKT_MULSH")));
          if (getenv("RKT_WPOKE")) {
