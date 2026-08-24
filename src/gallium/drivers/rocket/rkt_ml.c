@@ -329,6 +329,39 @@ lower_max_pooling(struct rkt_ml_subgraph *subgraph,
    operation->add_tensor = -1;
 }
 
+/* A fully-connected layer over a 1x1 spatial input is a 1x1 convolution:
+ * the TFLite [out, in] weight matrix is bytewise identical to a 1x1 OHWI
+ * conv weight tensor [out, 1, 1, in], only the dims move (teflon
+ * right-aligns the 2D matrix into [1, 1, out, in]).  Weights larger than
+ * the CBUF stream through the big-FC conv path. */
+static void
+lower_fully_connected(struct rkt_ml_subgraph *subgraph,
+                      const struct pipe_ml_operation *pfcon,
+                      struct rkt_operation *operation)
+{
+   struct pipe_ml_operation conv = {0};
+   struct pipe_tensor weight_tensor = *pfcon->fcon.weight_tensor;
+
+   weight_tensor.dims[0] = pfcon->fcon.weight_tensor->dims[2];
+   weight_tensor.dims[1] = 1;
+   weight_tensor.dims[2] = 1;
+   weight_tensor.dims[3] = pfcon->fcon.weight_tensor->dims[3];
+
+   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+   conv.input_tensors = pfcon->input_tensors;
+   conv.output_tensors = pfcon->output_tensors;
+   conv.conv.weight_tensor = &weight_tensor;
+   conv.conv.bias_tensor = pfcon->fcon.bias_tensor;
+   conv.conv.stride_x = 1;
+   conv.conv.stride_y = 1;
+   conv.conv.relu = pfcon->fcon.relu;
+   conv.conv.pointwise = true;
+   conv.conv.dilation_width_factor = 1;
+   conv.conv.dilation_height_factor = 1;
+
+   lower_convolution(subgraph, &conv, operation, 0);
+}
+
 static struct rkt_operation *
 find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
 {
@@ -374,6 +407,10 @@ count_tensors(const struct pipe_ml_operation *poperations,
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING:
          /* lowered to a synthetic depthwise convolution; no extra tensors */
+         break;
+      case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED:
+         tensor_count = MAX2(tensor_count, poperation->fcon.weight_tensor->index);
+         tensor_count = MAX2(tensor_count, poperation->fcon.bias_tensor->index);
          break;
       default:
          DBG("poperation->type %d\n", poperation->type);
@@ -485,6 +522,19 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                          operation->pooling.padding_top +
                          operation->pooling.padding_bottom;
       break;
+   case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED: {
+      struct pipe_tensor *input_tensor = operation->input_tensors[0];
+
+      /* Runs as a 1x1 convolution, so the input must already be a single
+       * spatial pixel (a flattened [1, N] input qualifies: teflon
+       * right-aligns it into [1, 1, 1, N]). */
+      supported = tensor_quantization_supported(input_tensor) &&
+                  tensor_quantization_supported(operation->fcon.weight_tensor) &&
+                  tensor_quantization_supported(operation->fcon.bias_tensor) &&
+                  tensor_quantization_supported(operation->output_tensors[0]) &&
+                  input_tensor->dims[1] == 1 && input_tensor->dims[2] == 1;
+      break;
+   }
    default:
       supported = false;
    }
@@ -596,6 +646,10 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          util_dynarray_append(&subgraph->operations, operation);
          break;
       }
+      case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED:
+         lower_fully_connected(subgraph, &poperations[i], &operation);
+         util_dynarray_append(&subgraph->operations, operation);
+         break;
       case PIPE_ML_OPERATION_TYPE_ADD: {
          /* Fuse tensor addition into a convolution.  The host must be
           * whichever producer runs LAST in the task chain: its EW stream
