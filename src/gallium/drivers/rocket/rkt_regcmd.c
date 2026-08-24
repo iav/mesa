@@ -731,6 +731,22 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    unsigned channels = operation->input_channels;
    unsigned out_w = operation->output_width;
    unsigned out_h = operation->output_height;
+
+   /* The PPU derives its window count from the input cube, rounding UP:
+    * feed it more rows/columns than the windows consume and it emits an
+    * extra output row/column, shearing the destination (mpC, VALID 3x3
+    * s2 on 56x56: 28 columns written into a 27-wide cube).  The vendor
+    * clips the cube to (out - 1) * stride + kernel - padding (probe
+    * MPvalid56: cube 55 of a 56-row map) while the RDMA line/surface
+    * strides keep the full-map values. */
+   unsigned cube_w = MIN2(in_w, (out_w - 1) * operation->stride +
+                                   operation->weights_width -
+                                   operation->padding_left -
+                                   operation->padding_right);
+   unsigned cube_h = MIN2(in_h, (out_h - 1) * operation->stride +
+                                   operation->weights_height -
+                                   operation->padding_top -
+                                   operation->padding_bottom);
    uint32_t src_addr =
       rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
    uint32_t dst_addr =
@@ -741,8 +757,8 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
 
    PPU_WORD(PPU_TARGET, 0xe, 0x6004);      /* S_POINTER */
    PPU_WORD(PPU_RDMA_TARGET, 0xe, 0x7004); /* RDMA_S_POINTER */
-   PPU_WORD(PPU_TARGET, in_w - 1, 0x600c);
-   PPU_WORD(PPU_TARGET, in_h - 1, 0x6010);
+   PPU_WORD(PPU_TARGET, cube_w - 1, 0x600c);
+   PPU_WORD(PPU_TARGET, cube_h - 1, 0x6010);
    PPU_WORD(PPU_TARGET, channels - 1, 0x6014);
    PPU_WORD(PPU_TARGET, out_w - 1, 0x6018);
    PPU_WORD(PPU_TARGET, out_h - 1, 0x601c);
@@ -787,8 +803,8 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    PPU_WORD(PPU_TARGET, out_surf, 0x607c);  /* DST_SURF_STRIDE, bytes */
    PPU_WORD(PPU_TARGET, out_surf, 0x6084);  /* DATA_FORMAT / INDEX_ADD */
    PPU_WORD(PPU_TARGET, 0x3, 0x60dc);       /* MISC_CTRL burst */
-   PPU_WORD(PPU_RDMA_TARGET, in_w - 1, 0x700c);
-   PPU_WORD(PPU_RDMA_TARGET, in_h - 1, 0x7010);
+   PPU_WORD(PPU_RDMA_TARGET, cube_w - 1, 0x700c);
+   PPU_WORD(PPU_RDMA_TARGET, cube_h - 1, 0x7010);
    PPU_WORD(PPU_RDMA_TARGET, channels - 1, 0x7014);
    PPU_WORD(PPU_RDMA_TARGET, 0x1, 0x7018);
    PPU_WORD(PPU_RDMA_TARGET, src_addr, 0x701c); /* SRC_BASE_ADDR */
