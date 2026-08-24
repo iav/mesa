@@ -15,10 +15,24 @@ calc_entries_per_slice(struct rkt_operation *operation)
     * reproduces every DATA_ENTRIES value (C = 8..512, W = 7..224). */
    unsigned atomics_per_entry = 4;
    /* Depthwise with C>32 runs as 32-channel-group tasks -- CBUF holds one
-    * group at a time. */
+    * group at a time.  Regular convolutions must count the channels the
+    * DATA_SIZE1 register actually declares -- align(max(C, 16), 16), see
+    * fill_task -- not the real ones: the hardware fills CBUF entries for
+    * the declared channels, and sizing the banks for the real count
+    * overflows the bank and wraps the input rows (RE 2026-08-24, mp56
+    * tail: an 8-channel 56x56 single-task conv writes 28 entries per row
+    * into a bank sized for 14, and every row past 1024/28 = 36.5 reads
+    * back from the start of the bank; the wrap row tracked the predicted
+    * bank boundary exactly across W = 48..112).  The 3-channel input is
+    * the packed-ARGB line path: one atomic per pixel, keep the real
+    * count. */
    unsigned eff_channels = operation->depthwise
                               ? MIN2(operation->input_channels, 32)
-                              : operation->input_channels;
+                              : (operation->input_channels == 3
+                                    ? operation->input_channels
+                                    : align(MAX2(operation->input_channels,
+                                                 FEATURE_ATOMIC_SIZE),
+                                            FEATURE_ATOMIC_SIZE));
    unsigned total_c_atomics = DIV_ROUND_UP(eff_channels, 8);
    unsigned last_c_atomics = total_c_atomics % atomics_per_entry;
    unsigned int_c_entries =
