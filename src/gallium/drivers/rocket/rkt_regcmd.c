@@ -415,7 +415,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
-           task->output_offset +
+           operation->dst_offset + task->output_offset +
            task->channel_group *
               rkt_surf_px(operation->output_width * operation->output_height) *
               32);
@@ -734,7 +734,8 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    uint32_t src_addr =
       rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
    uint32_t dst_addr =
-      rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
+      rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
+      operation->dst_offset;
    unsigned in_surf = rkt_surf_px(in_w * in_h) * 8;
    unsigned out_surf = rkt_surf_px(out_w * out_h) * 8;
 
