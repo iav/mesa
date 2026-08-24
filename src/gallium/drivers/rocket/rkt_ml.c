@@ -222,22 +222,29 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->padding_right = poperation->conv.padding_right;
    operation->stride = poperation->conv.stride_x;
 
+   /* Axis convention (RE 2026-08-24, layer-rect probes): width is the
+    * CONTIGUOUS memory row -- NHWC dims[2] -- and height is dims[1], the
+    * axis the band splitter cuts.  This matches the vendor stream (its
+    * 98x224 probe announces DATAIN_WIDTH=224).  The old dims[1]-as-width
+    * reading was self-consistent only on square maps: the input packer
+    * already wrote memory rows, so every non-square map sheared (and the
+    * output unpacker even wrote past the user buffer). */
    operation->input_index = poperation->input_tensors[0]->index;
-   operation->input_width = poperation->input_tensors[0]->dims[1];
-   operation->input_height = poperation->input_tensors[0]->dims[2];
+   operation->input_width = poperation->input_tensors[0]->dims[2];
+   operation->input_height = poperation->input_tensors[0]->dims[1];
    operation->input_channels = poperation->input_tensors[0]->dims[3];
    operation->input_zero_point = poperation->input_tensors[0]->zero_point;
    operation->input_scale = poperation->input_tensors[0]->scale;
 
    operation->output_index = poperation->output_tensors[0]->index;
-   operation->output_width = poperation->output_tensors[0]->dims[1];
-   operation->output_height = poperation->output_tensors[0]->dims[2];
+   operation->output_width = poperation->output_tensors[0]->dims[2];
+   operation->output_height = poperation->output_tensors[0]->dims[1];
    operation->output_channels = poperation->output_tensors[0]->dims[3];
    operation->output_zero_point = poperation->output_tensors[0]->zero_point;
    operation->output_scale = poperation->output_tensors[0]->scale;
 
-   operation->weights_width = poperation->conv.weight_tensor->dims[1];
-   operation->weights_height = poperation->conv.weight_tensor->dims[2];
+   operation->weights_width = poperation->conv.weight_tensor->dims[2];
+   operation->weights_height = poperation->conv.weight_tensor->dims[1];
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
    operation->weights_scale = poperation->conv.weight_tensor->scale;
 
@@ -307,15 +314,15 @@ lower_max_pooling(struct rkt_ml_subgraph *subgraph,
    operation->is_pool = true;
 
    operation->input_index = ppool->input_tensors[0]->index;
-   operation->input_width = ppool->input_tensors[0]->dims[1];
-   operation->input_height = ppool->input_tensors[0]->dims[2];
+   operation->input_width = ppool->input_tensors[0]->dims[2];
+   operation->input_height = ppool->input_tensors[0]->dims[1];
    operation->input_channels = ppool->input_tensors[0]->dims[3];
    operation->input_zero_point = ppool->input_tensors[0]->zero_point;
    operation->input_scale = ppool->input_tensors[0]->scale;
 
    operation->output_index = ppool->output_tensors[0]->index;
-   operation->output_width = ppool->output_tensors[0]->dims[1];
-   operation->output_height = ppool->output_tensors[0]->dims[2];
+   operation->output_width = ppool->output_tensors[0]->dims[2];
+   operation->output_height = ppool->output_tensors[0]->dims[1];
    operation->output_channels = ppool->output_tensors[0]->dims[3];
    operation->output_zero_point = ppool->output_tensors[0]->zero_point;
    operation->output_scale = ppool->output_tensors[0]->scale;
@@ -602,17 +609,17 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                    /* every window must fit input+padding or the PPU
                     * starves and the chain wedges */
                    (operation->output_tensors[0]->dims[1] - 1) *
-                         operation->pooling.stride_x +
-                         operation->pooling.filter_width <=
-                      operation->input_tensors[0]->dims[1] +
-                         operation->pooling.padding_left +
-                         operation->pooling.padding_right &&
-                   (operation->output_tensors[0]->dims[2] - 1) *
                          operation->pooling.stride_y +
                          operation->pooling.filter_height <=
-                      operation->input_tensors[0]->dims[2] +
+                      operation->input_tensors[0]->dims[1] +
                          operation->pooling.padding_top +
-                         operation->pooling.padding_bottom;
+                         operation->pooling.padding_bottom &&
+                   (operation->output_tensors[0]->dims[2] - 1) *
+                         operation->pooling.stride_x +
+                         operation->pooling.filter_width <=
+                      operation->input_tensors[0]->dims[2] +
+                         operation->pooling.padding_left +
+                         operation->pooling.padding_right;
       break;
    case PIPE_ML_OPERATION_TYPE_CONCATENATION: {
       struct pipe_tensor *output_tensor = operation->output_tensors[0];
@@ -817,8 +824,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
          struct rkt_concat_shape shape = {
             .index = out->index,
-            .width = out->dims[1],
-            .height = out->dims[2],
+            .width = out->dims[2],
+            .height = out->dims[1],
             .channels = out->dims[3],
          };
          util_dynarray_append(&subgraph->concat_shapes, shape);
@@ -1006,7 +1013,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          unsigned input_height = operation->input_height;
          unsigned zero_point = operation->input_zero_point;
          struct pipe_transfer *transfer_out;
-         uint8_t(*input_in)[input_height][input_channels] = inputs[i];
+         /* NHWC user memory: [height (dims[1])][width (dims[2])][C]. */
+         uint8_t(*input_in)[input_width][input_channels] = inputs[i];
          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
                                         PIPE_MAP_WRITE, &transfer_out);
 
@@ -1021,21 +1029,21 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          if (input_channels == 3) {
             /* ARGB input: packed RGB, raw uint8 (the CNA CVT stage shifts by
              * -128), rows aligned to 8 bytes with zero padding. */
-            unsigned line = DIV_ROUND_UP(input_height * 3, 8) * 8;
-            for (int x = 0; x < input_width; x++) {
-               unsigned n = x * line;
-               for (int y = 0; y < input_height; y++)
+            unsigned line = DIV_ROUND_UP(input_width * 3, 8) * 8;
+            for (int y = 0; y < input_height; y++) {
+               unsigned n = y * line;
+               for (int x = 0; x < input_width; x++)
                   for (int c = 0; c < 3; c++)
-                     map[n++] = input_in[x][y][c];
-               for (; n < (x + 1) * line;)
+                     map[n++] = input_in[y][x][c];
+               for (; n < (y + 1) * line;)
                   map[n++] = 0;
             }
          } else if (input_channels == 1) {
             unsigned n = 0;
-            for (int x = 0; x < input_width; x++) {
-               for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
-                  if (y < input_height)
-                     map[n++] = input_in[x][y][0];
+            for (int y = 0; y < input_height; y++) {
+               for (int x = 0; x < MAX2(input_width, FEATURE_ATOMIC_SIZE); x++) {
+                  if (x < input_width)
+                     map[n++] = input_in[y][x][0];
                   else
                      map[n++] = zero_point;
                }
@@ -1050,12 +1058,12 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                rkt_surf_px(input_width * input_height) -
                input_width * input_height;
             for (int u = 0; u < DIV_ROUND_UP(input_channels, 8); u++) {
-               for (int x = 0; x < input_width; x++) {
-                  for (int y = 0; y < input_height; y++) {
+               for (int y = 0; y < input_height; y++) {
+                  for (int x = 0; x < input_width; x++) {
                      for (int c = 0; c < 8; c++) {
                         unsigned input_channel = c + u * 8;
                         if (input_channel < input_channels)
-                           map[n++] = input_in[x][y][input_channel] - 0x80;
+                           map[n++] = input_in[y][x][input_channel] - 0x80;
                         else
                            map[n++] = zero_point - 0x80;
                      }
@@ -1363,8 +1371,8 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          /* Same planar 8-channel / 8-byte-pixel layout as the input side
           * (verified against the live vendor capture 2026-08-22). */
          uint8_t *raw = (uint8_t *)output_in;
-         unsigned rows = out_w;   /* dims[1] */
-         unsigned cols = out_h;   /* dims[2] */
+         unsigned rows = out_h;   /* memory rows, dims[1] */
+         unsigned cols = out_w;   /* contiguous row length, dims[2] */
          unsigned surf = rkt_surf_px(rows * cols) * 8;
          for (int oc = 0; oc < out_c; oc++) {
             unsigned g = oc / 8, c = oc % 8;
