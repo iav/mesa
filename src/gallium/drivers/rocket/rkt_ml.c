@@ -398,17 +398,23 @@ lower_fully_connected(struct rkt_ml_subgraph *subgraph,
  * with an identity weight matrix.  Used when the input cannot just be
  * written in place by its producer (it comes from outside the
  * partition, has other consumers, or its producer is a PPU pool chunk,
- * which has no requant stage). */
+ * which has no requant stage).
+ *
+ * force_pointwise: a copy that will HOST a fused addition must be
+ * pointwise -- with a depthwise host the EW RDMA runs in the depthwise
+ * feature mode (RDMA_FEATURE_MODE_CFG 0x7816) and reads the second
+ * operand with the wrong surface walk (RE 2026-08-24, addonly probes:
+ * the first two 8-channel surfaces come out ~1/4 range low on every
+ * non-uniform input, bitwise with a pointwise host). */
 static void
 lower_identity_copy(struct rkt_ml_subgraph *subgraph,
                     struct pipe_tensor *input,
                     const struct pipe_tensor *output,
-                    unsigned dst_offset,
+                    unsigned dst_offset, bool force_pointwise,
                     struct rkt_operation *operation)
 {
    unsigned channels = input->dims[3];
-   bool depthwise =
-      channels > 1 && channels % 32 == 0 && !getenv("RKT_COPY_PW");
+   bool depthwise = channels > 1 && channels % 32 == 0 && !force_pointwise;
    struct pipe_ml_operation conv = {0};
    struct pipe_tensor out_view = *input;
    struct pipe_tensor weight_tensor = {0};
@@ -782,8 +788,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
     * with a synthetic intermediate tensor.  Reserve a slot per pool. */
    unsigned synth_index = tensor_count;
    for (unsigned i = 0; i < count; i++)
-      if (poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING ||
-          poperations[i].type == PIPE_ML_OPERATION_TYPE_ADD)
+      if (poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING)
          tensor_count++;
 
    subgraph->tensors = UTIL_DYNARRAY_INIT;
@@ -842,7 +847,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                copy.add_tensor = -1;
                synth.index = synth_index++;
                lower_identity_copy(subgraph, pp->input_tensors[0], &synth, 0,
-                                   &copy);
+                                   false, &copy);
                util_dynarray_append(&subgraph->operations, copy);
                pool_input = synth.index;
             }
@@ -900,7 +905,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             } else {
                struct rkt_operation copy = {0};
                copy.add_tensor = -1;
-               lower_identity_copy(subgraph, in, out, dst_offset, &copy);
+               lower_identity_copy(subgraph, in, out, dst_offset, false,
+                                   &copy);
                util_dynarray_append(&subgraph->operations, copy);
             }
             ch_off += in->dims[3];
@@ -935,36 +941,21 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          if (prod0 == NULL && prod1 == NULL) {
             /* Both inputs come from outside the partition (a detached
              * residual, e.g. a yolo partition opening with the ADD):
-             * synthesize BOTH producers as identity convolutions.  The
-             * second input MUST be one too: the EW RDMA reads garbage
-             * (zeroes) from a CPU-packed job INPUT buffer, while it
-             * reads NPU-written tensors fine (every working fused add
-             * has an in-partition producer; RE 2026-08-24, addonly
-             * probe + RKT_EWPOKE) -- so give it one. */
-            struct pipe_tensor synth = *poperations[i].input_tensors[1];
-            struct rkt_operation copy1 = {0};
+             * synthesize the host as a pointwise identity convolution
+             * copying input 0 into the ADD output's domain; the EW
+             * stage adds input 1 straight from the job input buffer. */
             struct rkt_operation copy = {0};
-
-            copy1.add_tensor = -1;
-            synth.index = synth_index++;
-            lower_identity_copy(subgraph, poperations[i].input_tensors[1],
-                                &synth, 0, &copy1);
-            util_dynarray_append(&subgraph->operations, copy1);
 
             copy.add_tensor = -1;
             lower_identity_copy(subgraph, poperations[i].input_tensors[0],
-                                poperations[i].output_tensors[0], 0, &copy);
+                                poperations[i].output_tensors[0], 0, true,
+                                &copy);
             util_dynarray_append(&subgraph->operations, copy);
             prod0 = util_dynarray_element(
                &subgraph->operations, struct rkt_operation,
                util_dynarray_num_elements(&subgraph->operations,
                                           struct rkt_operation) -
                   1);
-            prod1 = util_dynarray_element(
-               &subgraph->operations, struct rkt_operation,
-               util_dynarray_num_elements(&subgraph->operations,
-                                          struct rkt_operation) -
-                  2);
          }
 
          assert(prod0 || prod1);
@@ -977,6 +968,38 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             host = prod1;
             other_op = prod0;
             other = poperations[i].input_tensors[0];
+         }
+
+         /* A depthwise host reads the EW operand with the wrong surface
+          * walk (see lower_identity_copy); when the other producer is a
+          * regular convolution AND runs later in the chain it can host
+          * instead, otherwise fall back to a pointwise identity copy of
+          * the depthwise output hosting the add. */
+         if (host->depthwise) {
+            if (other_op && !other_op->depthwise && other_op > host) {
+               struct rkt_operation *t = host;
+               host = other_op;
+               other_op = t;
+               other = other == poperations[i].input_tensors[0]
+                          ? poperations[i].input_tensors[1]
+                          : poperations[i].input_tensors[0];
+            } else {
+               struct pipe_tensor dw_out = {0};
+               struct rkt_operation copy = {0};
+               unsigned k = host == prod0 ? 0 : 1;
+
+               dw_out = *poperations[i].input_tensors[k];
+               copy.add_tensor = -1;
+               lower_identity_copy(subgraph, &dw_out,
+                                   poperations[i].output_tensors[0], 0, true,
+                                   &copy);
+               util_dynarray_append(&subgraph->operations, copy);
+               host = util_dynarray_element(
+                  &subgraph->operations, struct rkt_operation,
+                  util_dynarray_num_elements(&subgraph->operations,
+                                             struct rkt_operation) -
+                     1);
+            }
          }
 
          if (other_op == NULL) {
@@ -1143,10 +1166,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             }
          }
       }
-
-      if (getenv("RKT_TRACE_IN"))
-         fprintf(stderr, "rkt invoke: input %u %s op=%p\n", input_idxs[i],
-                 addition_feed ? "ADDITION" : "primary", (void *)operation);
 
       struct pipe_resource *input =
          &rkt_get_tensor(subgraph, input_idxs[i])->base;

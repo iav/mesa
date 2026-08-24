@@ -562,7 +562,22 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       if (operation->truncate_bits > 0)
          shift--;
 
+      /* 15-bit mantissa with the implicit leading one folded into bit
+       * 14 (the "|= 1 << 14" below only fires when the top explicit
+       * mantissa bit is clear).  Rounding a mantissa of 0x3fff up to
+       * 0x4000 sets that bit from the ROUNDING, so the |= is a no-op
+       * and the value is 2^e * 1.0 at exponent e when it should be
+       * 2^e * 2.0 -- half the intended scale.  A conv_scale a hair
+       * under a power of two hits exactly that (RE 2026-08-24, int8
+       * addonly probe: 0.0039062488 came out as 0x4000 >> 23 instead of
+       * 0x4000 >> 22).  Carry the round-up into the exponent. */
       unsigned scale = ((scale_bits >> 9) & 0x7fff) + 1;
+      if (scale == 0x4000 && ((scale_bits >> 9) & 0x4000) == 0) {
+         shift--;
+      } else if (scale == 0x8000) {
+         scale = 0x4000;
+         shift--;
+      }
       if (scale < 1 << 14)
          scale |= 1 << 14;
 
@@ -633,19 +648,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * 0x503c (EW line stride) = surf stride - 8 and EW_SURF_STRIDE =
        * Wout*Hout*8, both in raw bytes (t3: 0x61f8 / 0x6200). */
       emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000000);
-      if (getenv("RKT_TRACE_IN"))
-         fprintf(stderr,
-                 "rkt ew: add_tensor=%d phys=0x%lx out_off=%u wphys=0x%lx\n",
-                 operation->add_tensor,
-                 (unsigned long)rkt_get_tensor(subgraph, operation->add_tensor)
-                    ->phys_addr,
-                 task->output_offset,
-                 (unsigned long)rkt_resource(operation->weights)->phys_addr);
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-           getenv("RKT_EWPOKE")
-              ? rkt_resource(operation->weights)->phys_addr
-              : rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
-                   task->output_offset);
+           rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
+              task->output_offset);
       /* The second-input tensor keeps full-height surfaces regardless of
        * banding, so the EW surface stride spans the full tensor height
        * even on a band task (vendor probe-ADDB: 0x6200 on both bands of a
