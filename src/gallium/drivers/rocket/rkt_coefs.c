@@ -72,6 +72,27 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
                }
       goto packed;
    }
+   if (rkt_is_depthwise(poperation)) {
+      /* Depthwise C <= 32: one group, [tap (row-major)][channel] rows at
+       * the stride the registers announce -- align(max(C, 16), 16), the
+       * same value fill_task puts in DATAIN_CHANNEL and WEIGHT_SIZE runs
+       * over.  The generic packer below used the REAL channel count for
+       * the row stride, which only matched for C = 8/16 (align equal or
+       * the tail feeding unread output channels); C = 24 packed 24-byte
+       * rows read back at 32 and every real channel past the first tap
+       * shifted (layer-dw3x3-c24 vs vendor probe-DW24k3: WEIGHT_BYTES
+       * 288 = 9 taps * 32). */
+      unsigned stride =
+         align(MAX2(input_channels_real, FEATURE_ATOMIC_SIZE),
+               FEATURE_ATOMIC_SIZE);
+      for (int y = 0; y < weights_height; y++)
+         for (int x = 0; x < weights_width; x++)
+            for (unsigned c = 0; c < stride; c++)
+               weights_out[n++] = c < input_channels_real
+                                     ? weights_in[0][y][x][c] - 0x80
+                                     : 0;
+      goto packed;
+   }
    if (!rkt_is_depthwise(poperation)) {
       /* RK3568 regular-conv weight layout, solved by probe-model RE
        * (2026-08-22, Test 43): known-weight models converted with
