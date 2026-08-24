@@ -373,13 +373,16 @@ lower_fully_connected(struct rkt_ml_subgraph *subgraph,
 }
 
 /* Copy (and requantize) one tensor into a slice of a concatenation
- * output: a pointwise convolution with an identity weight matrix (q 255
- * on the diagonal, scale 1/255), the regular BS pipeline requantizes
- * into the concat output's domain.  A depthwise formulation would be
- * cheaper, but the depthwise weight layout is only correct for C >= 32
- * (RE 2026-08-24, layer-dw1x1 probes: C=16 garbage, C=32 exact); the
- * pointwise path is exercised everywhere.  Used when the input cannot
- * just be written in place by its producer (it comes from outside the
+ * output: a 1x1 depthwise convolution with all weights q 255 and scale
+ * 1/255 (a per-channel identity), the regular BS pipeline requantizes
+ * into the concat output's domain.  Only for C % 32 == 0: a depthwise
+ * convolution with fewer channels declares align(C, 32) of them to the
+ * DPU cube and writes the padding surfaces too, which would clobber the
+ * neighbouring slice of the concat output (RE 2026-08-24,
+ * layer-concat-mixed: C=16 copy at offset 0 corrupts the C=32 slice
+ * behind it).  Everything else falls back to the pointwise formulation
+ * with an identity weight matrix.  Used when the input cannot just be
+ * written in place by its producer (it comes from outside the
  * partition, has other consumers, or its producer is a PPU pool chunk,
  * which has no requant stage). */
 static void
@@ -390,13 +393,14 @@ lower_identity_copy(struct rkt_ml_subgraph *subgraph,
                     struct rkt_operation *operation)
 {
    unsigned channels = input->dims[3];
+   bool depthwise = channels > 1 && channels % 32 == 0;
    struct pipe_ml_operation conv = {0};
    struct pipe_tensor out_view = *input;
    struct pipe_tensor weight_tensor = {0};
    struct pipe_tensor bias_tensor = {0};
    struct pipe_tensor *in_ptr = input;
    struct pipe_tensor *out_ptr = &out_view;
-   uint8_t *wdata = calloc(channels, channels);
+   uint8_t *wdata = calloc(channels, depthwise ? 1 : channels);
    int32_t *bdata = calloc(channels, sizeof(int32_t));
 
    /* The output slice keeps the input's geometry but lives in the concat
@@ -405,10 +409,13 @@ lower_identity_copy(struct rkt_ml_subgraph *subgraph,
    out_view.scale = output->scale;
    out_view.zero_point = output->zero_point;
 
-   for (unsigned c = 0; c < channels; c++)
-      wdata[c * channels + c] = 0xff;
+   if (depthwise)
+      memset(wdata, 0xff, channels);
+   else
+      for (unsigned c = 0; c < channels; c++)
+         wdata[c * channels + c] = 0xff;
 
-   weight_tensor.dims[0] = channels;
+   weight_tensor.dims[0] = depthwise ? 1 : channels;
    weight_tensor.dims[1] = 1;
    weight_tensor.dims[2] = 1;
    weight_tensor.dims[3] = channels;
@@ -426,7 +433,8 @@ lower_identity_copy(struct rkt_ml_subgraph *subgraph,
    conv.conv.bias_tensor = &bias_tensor;
    conv.conv.stride_x = 1;
    conv.conv.stride_y = 1;
-   conv.conv.pointwise = true;
+   conv.conv.depthwise = depthwise;
+   conv.conv.pointwise = !depthwise;
    conv.conv.dilation_width_factor = 1;
    conv.conv.dilation_height_factor = 1;
 
