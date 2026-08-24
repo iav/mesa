@@ -49,7 +49,10 @@ create_tensor(struct rkt_ml_subgraph *subgraph, unsigned idx,
    struct pipe_resource *res = tensors[idx];
 
    if (res != NULL) {
-      assert(size == pipe_buffer_size(res));
+      /* A concatenation output is created at its full size up front;
+       * the retargeted producers then "create" it at their own slice
+       * size, which only has to fit. */
+      assert(size <= pipe_buffer_size(res));
       return;
    }
 
@@ -362,6 +365,90 @@ lower_fully_connected(struct rkt_ml_subgraph *subgraph,
    lower_convolution(subgraph, &conv, operation, 0);
 }
 
+/* Copy (and requantize) one tensor into a slice of a concatenation
+ * output: a pointwise convolution with an identity weight matrix (q 255
+ * on the diagonal, scale 1/255), the regular BS pipeline requantizes
+ * into the concat output's domain.  A depthwise formulation would be
+ * cheaper, but the depthwise weight layout is only correct for C >= 32
+ * (RE 2026-08-24, layer-dw1x1 probes: C=16 garbage, C=32 exact); the
+ * pointwise path is exercised everywhere.  Used when the input cannot
+ * just be written in place by its producer (it comes from outside the
+ * partition, has other consumers, or its producer is a PPU pool chunk,
+ * which has no requant stage). */
+static void
+lower_identity_copy(struct rkt_ml_subgraph *subgraph,
+                    struct pipe_tensor *input,
+                    const struct pipe_tensor *output,
+                    unsigned dst_offset,
+                    struct rkt_operation *operation)
+{
+   unsigned channels = input->dims[3];
+   struct pipe_ml_operation conv = {0};
+   struct pipe_tensor out_view = *input;
+   struct pipe_tensor weight_tensor = {0};
+   struct pipe_tensor bias_tensor = {0};
+   struct pipe_tensor *in_ptr = input;
+   struct pipe_tensor *out_ptr = &out_view;
+   uint8_t *wdata = calloc(channels, channels);
+   int32_t *bdata = calloc(channels, sizeof(int32_t));
+
+   /* The output slice keeps the input's geometry but lives in the concat
+    * output tensor, in its quantization domain. */
+   out_view.index = output->index;
+   out_view.scale = output->scale;
+   out_view.zero_point = output->zero_point;
+
+   for (unsigned c = 0; c < channels; c++)
+      wdata[c * channels + c] = 0xff;
+
+   weight_tensor.dims[0] = channels;
+   weight_tensor.dims[1] = 1;
+   weight_tensor.dims[2] = 1;
+   weight_tensor.dims[3] = channels;
+   weight_tensor.scale = 1.0f / 255;
+   weight_tensor.zero_point = 0;
+   weight_tensor.data = wdata;
+
+   bias_tensor.dims[3] = channels;
+   bias_tensor.data = (uint8_t *)bdata;
+
+   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+   conv.input_tensors = &in_ptr;
+   conv.output_tensors = &out_ptr;
+   conv.conv.weight_tensor = &weight_tensor;
+   conv.conv.bias_tensor = &bias_tensor;
+   conv.conv.stride_x = 1;
+   conv.conv.stride_y = 1;
+   conv.conv.pointwise = true;
+   conv.conv.dilation_width_factor = 1;
+   conv.conv.dilation_height_factor = 1;
+
+   lower_convolution(subgraph, &conv, operation, 0);
+   operation->dst_offset = dst_offset;
+
+   free(wdata);
+   free(bdata);
+}
+
+/* Whether the concatenation at poperations[conc_idx] is the only reader
+ * of the tensor: only then may its producer be retargeted to write the
+ * concat output slice directly (the tensor itself then never
+ * materializes).  NOTE: a tensor that is also a partition OUTPUT cannot
+ * be detected here -- it has no reader among the operations. */
+static bool
+concat_is_sole_consumer(const struct pipe_ml_operation *poperations,
+                        unsigned count, unsigned conc_idx, unsigned index)
+{
+   for (unsigned j = 0; j < count; j++) {
+      if (j == conc_idx)
+         continue;
+      for (unsigned k = 0; k < poperations[j].input_count; k++)
+         if (poperations[j].input_tensors[k]->index == index)
+            return false;
+   }
+   return true;
+}
+
 static struct rkt_operation *
 find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
 {
@@ -411,6 +498,11 @@ count_tensors(const struct pipe_ml_operation *poperations,
       case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED:
          tensor_count = MAX2(tensor_count, poperation->fcon.weight_tensor->index);
          tensor_count = MAX2(tensor_count, poperation->fcon.bias_tensor->index);
+         break;
+      case PIPE_ML_OPERATION_TYPE_CONCATENATION:
+         for (unsigned j = 0; j < poperation->input_count; j++)
+            tensor_count =
+               MAX2(tensor_count, poperation->input_tensors[j]->index);
          break;
       default:
          DBG("poperation->type %d\n", poperation->type);
@@ -522,6 +614,33 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                          operation->pooling.padding_top +
                          operation->pooling.padding_bottom;
       break;
+   case PIPE_ML_OPERATION_TYPE_CONCATENATION: {
+      struct pipe_tensor *output_tensor = operation->output_tensors[0];
+      unsigned channels = 0;
+
+      /* Only channel-wise concatenation of same-geometry 4D tensors.  In
+       * the planar 8-channel surface layout it is pure addressing: each
+       * input occupies its own run of surfaces in the output BO.  The
+       * slice offsets must fall on the 16-channel allocation granularity,
+       * so every input but the last needs C % 16 == 0. */
+      if (operation->conc.axis != 3 && operation->conc.axis != -1)
+         break;
+
+      supported = tensor_quantization_supported(output_tensor);
+      for (unsigned i = 0; i < operation->input_count; i++) {
+         struct pipe_tensor *input_tensor = operation->input_tensors[i];
+
+         if (i > 0 && channels % 16 != 0)
+            supported = false;
+         channels += input_tensor->dims[3];
+
+         supported = supported &&
+                     tensor_quantization_supported(input_tensor) &&
+                     input_tensor->dims[1] == output_tensor->dims[1] &&
+                     input_tensor->dims[2] == output_tensor->dims[2];
+      }
+      break;
+   }
    case PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED: {
       struct pipe_tensor *input_tensor = operation->input_tensors[0];
 
@@ -608,6 +727,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    tensor_count = count_tensors(poperations, count);
    subgraph->tensors = UTIL_DYNARRAY_INIT;
    subgraph->operations = UTIL_DYNARRAY_INIT;
+   subgraph->concat_shapes = UTIL_DYNARRAY_INIT;
    if (!util_dynarray_resize(&subgraph->tensors, struct pipe_resource *,
                              tensor_count))
       return NULL;
@@ -650,6 +770,60 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          lower_fully_connected(subgraph, &poperations[i], &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
+      case PIPE_ML_OPERATION_TYPE_CONCATENATION: {
+         /* Channel concatenation is addressing, not computation: the
+          * output BO is created at full size and each input's producer
+          * is retargeted to write its own run of surfaces (dst_offset).
+          * When an input cannot be written in place -- produced outside
+          * the partition, read by other consumers too, or produced by a
+          * PPU pool chunk that would need a requant it does not have --
+          * an identity depthwise convolution copies (and requantizes) it
+          * into the slice instead. */
+         const struct pipe_ml_operation *pconc = &poperations[i];
+         const struct pipe_tensor *out = pconc->output_tensors[0];
+         unsigned surf = rkt_surf_px(out->dims[1] * out->dims[2]) * 8;
+         unsigned ch_off = 0;
+
+         create_tensor(subgraph, out->index,
+                       rkt_surf_px(out->dims[1] * out->dims[2]) *
+                          DIV_ROUND_UP(out->dims[3], FEATURE_ATOMIC_SIZE) * 2 *
+                          FEATURE_ATOMIC_SIZE);
+
+         for (unsigned k = 0; k < pconc->input_count; k++) {
+            struct pipe_tensor *in = pconc->input_tensors[k];
+            struct rkt_operation *prod =
+               find_producer(subgraph, in->index);
+            bool requant = in->scale != out->scale ||
+                           in->zero_point != out->zero_point;
+            unsigned dst_offset = (ch_off / 8) * surf;
+
+            if (prod != NULL &&
+                concat_is_sole_consumer(poperations, count, i, in->index) &&
+                !(prod->is_pool && requant)) {
+               prod->output_index = out->index;
+               prod->dst_offset = dst_offset;
+               if (!prod->is_pool) {
+                  prod->output_zero_point = out->zero_point;
+                  prod->output_scale = out->scale;
+               }
+            } else {
+               struct rkt_operation copy = {0};
+               copy.add_tensor = -1;
+               lower_identity_copy(subgraph, in, out, dst_offset, &copy);
+               util_dynarray_append(&subgraph->operations, copy);
+            }
+            ch_off += in->dims[3];
+         }
+
+         struct rkt_concat_shape shape = {
+            .index = out->index,
+            .width = out->dims[1],
+            .height = out->dims[2],
+            .channels = out->dims[3],
+         };
+         util_dynarray_append(&subgraph->concat_shapes, shape);
+         break;
+      }
       case PIPE_ML_OPERATION_TYPE_ADD: {
          /* Fuse tensor addition into a convolution.  The host must be
           * whichever producer runs LAST in the task chain: its EW stream
@@ -1149,14 +1323,28 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          rkt_get_tensor(subgraph, output_idxs[i]);
       struct pipe_transfer *transfer = NULL;
       uint8_t *raw_output;
+      unsigned out_w = operation->output_width;
+      unsigned out_h = operation->output_height;
+      unsigned out_c = operation->output_channels;
+
+      /* A concatenation output has several producers, each knowing only
+       * its own slice -- the full dims live in the shape table. */
+      util_dynarray_foreach (&subgraph->concat_shapes,
+                             struct rkt_concat_shape, cs) {
+         if (cs->index == output_idxs[i]) {
+            out_w = cs->width;
+            out_h = cs->height;
+            out_c = cs->channels;
+            break;
+         }
+      }
       /* RK3568 DPU output layout (RE 2026-08-22, layer-c28 quadrant map):
        * surfaces of 8 channels, 8 bytes per pixel, surface stride
        * Wout * Hout * 8 -- matches the vendor DST_SURF_STRIDE (0x1880 =
        * 28*28*8 for the 28x28 probe).  The previous 16-channel unpack only
        * looked correct on channel-uniform fills. */
-      uint8_t(*output_in)[operation->output_height][operation->output_width]
-                         [8];
-      uint8_t(*output_out)[operation->output_width][operation->output_channels];
+      uint8_t(*output_in)[out_h][out_w][8];
+      uint8_t(*output_out)[out_w][out_c];
 
       DBG("Before pipe_buffer_map\n");
       raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
@@ -1175,10 +1363,10 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          /* Same planar 8-channel / 8-byte-pixel layout as the input side
           * (verified against the live vendor capture 2026-08-22). */
          uint8_t *raw = (uint8_t *)output_in;
-         unsigned rows = operation->output_width;   /* dims[1] */
-         unsigned cols = operation->output_height;  /* dims[2] */
+         unsigned rows = out_w;   /* dims[1] */
+         unsigned cols = out_h;   /* dims[2] */
          unsigned surf = rkt_surf_px(rows * cols) * 8;
-         for (int oc = 0; oc < operation->output_channels; oc++) {
+         for (int oc = 0; oc < out_c; oc++) {
             unsigned g = oc / 8, c = oc % 8;
             for (unsigned y = 0; y < rows; y++) {
                for (unsigned x = 0; x < cols; x++) {
@@ -1221,6 +1409,7 @@ rkt_ml_subgraph_destroy(struct pipe_ml_device *pdevice,
       if (tensor)
          pipe_resource_reference(tensor, NULL);
    util_dynarray_fini(&subgraph->tensors);
+   util_dynarray_fini(&subgraph->concat_shapes);
 
    free(subgraph);
 }

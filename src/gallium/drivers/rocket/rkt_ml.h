@@ -148,7 +148,23 @@ struct rkt_operation {
 
    int add_tensor;
 
+   /* Byte offset added to the output tensor's base address.  Channel
+    * concatenation writes each producer into its slice of the shared
+    * output BO: in the planar 8-channel surface layout a producer's
+    * surfaces are self-contained, so the concat is just a base offset. */
+   unsigned dst_offset;
+
    struct util_dynarray tasks; /* struct split_task */
+};
+
+/* Dimensions of a concatenation output tensor.  Several operations then
+ * share that output_index (each with its own dst_offset and channel
+ * count), so readback cannot take the dims from find_producer(). */
+struct rkt_concat_shape {
+   unsigned index;
+   unsigned width;
+   unsigned height;
+   unsigned channels;
 };
 
 struct rkt_ml_subgraph {
@@ -157,6 +173,7 @@ struct rkt_ml_subgraph {
    struct pipe_context *context;
    struct util_dynarray operations; /* rkt_operation */
    struct util_dynarray tensors;    /* pipe_resource* */
+   struct util_dynarray concat_shapes; /* rkt_concat_shape */
 };
 
 /* RK3568 feature surfaces are padded to whole 32-byte CBUF entries: the
