@@ -740,6 +740,17 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    subgraph->context = dev->context;
 
    tensor_count = count_tensors(poperations, count);
+
+   /* A PPU pool chunk is hosted by the regcmd BO of a non-pool
+    * predecessor in the chain; a max pool with no such predecessor (the
+    * first operation of the partition, or right after another pool)
+    * gets a synthetic identity-copy carrier inserted in front of it,
+    * with a synthetic intermediate tensor.  Reserve a slot per pool. */
+   unsigned synth_index = tensor_count;
+   for (unsigned i = 0; i < count; i++)
+      if (poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING)
+         tensor_count++;
+
    subgraph->tensors = UTIL_DYNARRAY_INIT;
    subgraph->operations = UTIL_DYNARRAY_INIT;
    subgraph->concat_shapes = UTIL_DYNARRAY_INIT;
@@ -765,6 +776,15 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
           * fallback when the PPU cannot express it (kernel > 8, or a
           * requantizing pool -- the PPU chunk has no requant stage). */
          const struct pipe_ml_operation *pp = &poperations[i];
+         unsigned num_ops = util_dynarray_num_elements(&subgraph->operations,
+                                                       struct rkt_operation);
+         /* The PPU chunk lives in the regcmd BO of the operation right
+          * before it, which must not itself be a pool. */
+         bool need_carrier =
+            num_ops == 0 ||
+            util_dynarray_element(&subgraph->operations, struct rkt_operation,
+                                  num_ops - 1)
+               ->is_pool;
          bool ppu_ok = getenv("RKT_NO_PPU") == NULL &&
                        pp->pooling.filter_width <= 8 &&
                        pp->pooling.filter_height <= 8 &&
@@ -774,10 +794,31 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                           pp->output_tensors[0]->scale &&
                        pp->input_tensors[0]->zero_point ==
                           pp->output_tensors[0]->zero_point;
-         if (pp->pooling.type == PIPE_ML_POOLING_TYPE_MAX || ppu_ok)
+         if (pp->pooling.type == PIPE_ML_POOLING_TYPE_MAX ||
+             (ppu_ok && !need_carrier)) {
+            unsigned pool_input = ~0u;
+            if (need_carrier) {
+               /* Max pooling has no convolution formulation to fall
+                * back on: copy the input into a synthetic intermediate
+                * tensor with an identity convolution, which then hosts
+                * the chunk. */
+               struct rkt_operation copy = {0};
+               struct pipe_tensor synth = *pp->input_tensors[0];
+               copy.add_tensor = -1;
+               synth.index = synth_index++;
+               lower_identity_copy(subgraph, pp->input_tensors[0], &synth, 0,
+                                   &copy);
+               util_dynarray_append(&subgraph->operations, copy);
+               pool_input = synth.index;
+            }
             lower_max_pooling(subgraph, pp, &operation);
-         else
+            if (pool_input != ~0u)
+               operation.input_index = pool_input;
+         } else {
+            /* Average pooling without a chunk carrier just takes the
+             * depthwise lowering. */
             lower_pooling(subgraph, pp, &operation);
+         }
          util_dynarray_append(&subgraph->operations, operation);
          break;
       }
