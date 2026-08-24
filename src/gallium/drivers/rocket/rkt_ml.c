@@ -407,7 +407,8 @@ lower_identity_copy(struct rkt_ml_subgraph *subgraph,
                     struct rkt_operation *operation)
 {
    unsigned channels = input->dims[3];
-   bool depthwise = channels > 1 && channels % 32 == 0;
+   bool depthwise =
+      channels > 1 && channels % 32 == 0 && !getenv("RKT_COPY_PW");
    struct pipe_ml_operation conv = {0};
    struct pipe_tensor out_view = *input;
    struct pipe_tensor weight_tensor = {0};
@@ -781,7 +782,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
     * with a synthetic intermediate tensor.  Reserve a slot per pool. */
    unsigned synth_index = tensor_count;
    for (unsigned i = 0; i < count; i++)
-      if (poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING)
+      if (poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING ||
+          poperations[i].type == PIPE_ML_OPERATION_TYPE_ADD)
          tensor_count++;
 
    subgraph->tensors = UTIL_DYNARRAY_INIT;
@@ -930,6 +932,41 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          struct rkt_operation *host, *other_op;
          const struct pipe_tensor *other;
 
+         if (prod0 == NULL && prod1 == NULL) {
+            /* Both inputs come from outside the partition (a detached
+             * residual, e.g. a yolo partition opening with the ADD):
+             * synthesize BOTH producers as identity convolutions.  The
+             * second input MUST be one too: the EW RDMA reads garbage
+             * (zeroes) from a CPU-packed job INPUT buffer, while it
+             * reads NPU-written tensors fine (every working fused add
+             * has an in-partition producer; RE 2026-08-24, addonly
+             * probe + RKT_EWPOKE) -- so give it one. */
+            struct pipe_tensor synth = *poperations[i].input_tensors[1];
+            struct rkt_operation copy1 = {0};
+            struct rkt_operation copy = {0};
+
+            copy1.add_tensor = -1;
+            synth.index = synth_index++;
+            lower_identity_copy(subgraph, poperations[i].input_tensors[1],
+                                &synth, 0, &copy1);
+            util_dynarray_append(&subgraph->operations, copy1);
+
+            copy.add_tensor = -1;
+            lower_identity_copy(subgraph, poperations[i].input_tensors[0],
+                                poperations[i].output_tensors[0], 0, &copy);
+            util_dynarray_append(&subgraph->operations, copy);
+            prod0 = util_dynarray_element(
+               &subgraph->operations, struct rkt_operation,
+               util_dynarray_num_elements(&subgraph->operations,
+                                          struct rkt_operation) -
+                  1);
+            prod1 = util_dynarray_element(
+               &subgraph->operations, struct rkt_operation,
+               util_dynarray_num_elements(&subgraph->operations,
+                                          struct rkt_operation) -
+                  2);
+         }
+
          assert(prod0 || prod1);
 
          if (!prod1 || (prod0 && prod0 > prod1)) {
@@ -981,6 +1018,17 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          input_channels_1 * input_channels_2;
 
       create_tensor(subgraph, operation->input_index, input_size);
+
+      /* A fused-add second input read from outside the partition has no
+       * producer to create it; its geometry is the host's OUTPUT one. */
+      if (operation->add_tensor != -1 &&
+          find_producer(subgraph, operation->add_tensor) == NULL) {
+         unsigned add_size =
+            rkt_surf_px(operation->output_width * operation->output_height) *
+            DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) * 2 *
+            FEATURE_ATOMIC_SIZE;
+         create_tensor(subgraph, operation->add_tensor, add_size);
+      }
    }
 
    /* Create output tensors */
@@ -1079,13 +1127,37 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    for (int i = 0; i < inputs_count; i++) {
       struct rkt_operation *operation =
          find_first_consumer(subgraph, input_idxs[i]);
+      bool addition_feed = false;
+
+      /* A partition input can also be the second operand of a fused
+       * addition (no operation lists it as input_index then): pack it
+       * into the add tensor's BO with the HOST's output geometry and
+       * the addition operand's zero point. */
+      if (operation == NULL) {
+         util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                                op) {
+            if (op->add_tensor == (int)input_idxs[i]) {
+               operation = op;
+               addition_feed = true;
+               break;
+            }
+         }
+      }
+
+      if (getenv("RKT_TRACE_IN"))
+         fprintf(stderr, "rkt invoke: input %u %s op=%p\n", input_idxs[i],
+                 addition_feed ? "ADDITION" : "primary", (void *)operation);
+
       struct pipe_resource *input =
          &rkt_get_tensor(subgraph, input_idxs[i])->base;
-      unsigned input_channels = operation->input_channels;
+      unsigned input_channels =
+         addition_feed ? operation->output_channels : operation->input_channels;
       unsigned output_channels = operation->output_channels;
 
-      struct rkt_resource *input_tensor =
-         rkt_get_tensor(subgraph, operation->input_index);
+      struct rkt_resource *input_tensor = rkt_get_tensor(
+         subgraph,
+         addition_feed ? (unsigned)operation->add_tensor
+                       : operation->input_index);
       /* INT8 user buffers are folded into the driver's uint8 domain
        * bytewise (q_u8 = q_i8 XOR 0x80); the zero points were already
        * shifted by +128 when the tensors were created. */
@@ -1096,9 +1168,13 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
                           pipe_buffer_size(input));
       } else {
-         unsigned input_width = operation->input_width;
-         unsigned input_height = operation->input_height;
-         unsigned zero_point = operation->input_zero_point;
+         unsigned input_width = addition_feed ? operation->output_width
+                                              : operation->input_width;
+         unsigned input_height = addition_feed ? operation->output_height
+                                               : operation->input_height;
+         unsigned zero_point = addition_feed
+                                  ? 0x80 - operation->addition_offset
+                                  : operation->input_zero_point;
          struct pipe_transfer *transfer_out;
          /* NHWC user memory: [height (dims[1])][width (dims[2])][C]. */
          uint8_t(*input_in)[input_width][input_channels] = inputs[i];
@@ -1163,8 +1239,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          }
 
          if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
-            rkt_dump_buffer(map, "input", 0, 0, 0,
-                            rkt_get_tensor(subgraph, input_idxs[i])->bo_size);
+            rkt_dump_buffer(map, "input", 0, input_idxs[i], 0,
+                            pipe_buffer_size(&input_tensor->base));
 
          DBG("Converted data\n");
 

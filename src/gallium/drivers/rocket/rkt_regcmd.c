@@ -633,9 +633,19 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * 0x503c (EW line stride) = surf stride - 8 and EW_SURF_STRIDE =
        * Wout*Hout*8, both in raw bytes (t3: 0x61f8 / 0x6200). */
       emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000000);
+      if (getenv("RKT_TRACE_IN"))
+         fprintf(stderr,
+                 "rkt ew: add_tensor=%d phys=0x%lx out_off=%u wphys=0x%lx\n",
+                 operation->add_tensor,
+                 (unsigned long)rkt_get_tensor(subgraph, operation->add_tensor)
+                    ->phys_addr,
+                 task->output_offset,
+                 (unsigned long)rkt_resource(operation->weights)->phys_addr);
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-           rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
-              task->output_offset);
+           getenv("RKT_EWPOKE")
+              ? rkt_resource(operation->weights)->phys_addr
+              : rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
+                   task->output_offset);
       /* The second-input tensor keeps full-height surfaces regardless of
        * banding, so the EW surface stride spans the full tensor height
        * even on a band task (vendor probe-ADDB: 0x6200 on both bands of a
