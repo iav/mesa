@@ -746,20 +746,27 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    PPU_WORD(PPU_TARGET, out_w - 1, 0x6018);
    PPU_WORD(PPU_TARGET, out_h - 1, 0x601c);
    PPU_WORD(PPU_TARGET, channels - 1, 0x6020);
-   /* OPERATION_MODE_CFG, vendor-verbatim 0x11 (max pooling; the input
-    * still goes through PPU_RDMA -- RKT_PPU_MODE overrides for
-    * experiments). */
+   /* OPERATION_MODE_CFG: [1:0] method (0 avg / 1 max), [4] the vendor's
+    * flying bit (set even though the input goes through PPU_RDMA --
+    * RKT_PPU_MODE overrides for experiments). */
    PPU_WORD(PPU_TARGET,
-            getenv("RKT_PPU_MODE") ? strtol(getenv("RKT_PPU_MODE"), NULL, 0)
-                                   : 0x11,
+            getenv("RKT_PPU_MODE")
+               ? strtol(getenv("RKT_PPU_MODE"), NULL, 0)
+               : (operation->pool_avg ? 0x10 : 0x11),
             0x6024);
    PPU_WORD(PPU_TARGET,
             (operation->stride - 1) << 20 | (operation->stride - 1) << 16 |
                (operation->weights_height - 1) << 8 |
                (operation->weights_width - 1),
             0x6034); /* POOLING_KERNEL_CFG */
-   PPU_WORD(PPU_TARGET, 0, 0x6038); /* RECIP_KERNEL_WIDTH (avg only) */
-   PPU_WORD(PPU_TARGET, 0, 0x603c); /* RECIP_KERNEL_HEIGHT */
+   /* RECIP_KERNEL = 65536/kernel for average pooling (vendor probe-AP:
+    * kernel 7 -> 9362), zero for max. */
+   PPU_WORD(PPU_TARGET,
+            operation->pool_avg ? 65536 / operation->weights_width : 0,
+            0x6038);
+   PPU_WORD(PPU_TARGET,
+            operation->pool_avg ? 65536 / operation->weights_height : 0,
+            0x603c);
    /* POOLING_PADDING_CFG, [3:0] left [7:4] top [11:8] right [15:12]
     * bottom (RE-LOG Test 61, replay bit-mapping): every pooling window
     * must fall inside input+padding on BOTH axes or the PPU starves

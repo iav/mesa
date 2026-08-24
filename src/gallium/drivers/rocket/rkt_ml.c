@@ -324,6 +324,7 @@ lower_max_pooling(struct rkt_ml_subgraph *subgraph,
    operation->padding_bottom = ppool->pooling.padding_bottom;
    operation->padding_left = ppool->pooling.padding_left;
    operation->padding_right = ppool->pooling.padding_right;
+   operation->pool_avg = ppool->pooling.type == PIPE_ML_POOLING_TYPE_AVG;
 
    operation->add_tensor = -1;
 }
@@ -573,13 +574,28 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                            fused_add_pad(poperations, count, &poperations[i]));
          util_dynarray_append(&subgraph->operations, operation);
          break;
-      case PIPE_ML_OPERATION_TYPE_POOLING:
-         if (poperations[i].pooling.type == PIPE_ML_POOLING_TYPE_MAX)
-            lower_max_pooling(subgraph, &poperations[i], &operation);
+      case PIPE_ML_OPERATION_TYPE_POOLING: {
+         /* Average pooling prefers the PPU too (no synthetic depthwise
+          * weights, no CBUF); the depthwise lowering stays as the
+          * fallback when the PPU cannot express it (kernel > 8, or a
+          * requantizing pool -- the PPU chunk has no requant stage). */
+         const struct pipe_ml_operation *pp = &poperations[i];
+         bool ppu_ok = getenv("RKT_NO_PPU") == NULL &&
+                       pp->pooling.filter_width <= 8 &&
+                       pp->pooling.filter_height <= 8 &&
+                       pp->pooling.stride_x == pp->pooling.stride_y &&
+                       pp->pooling.stride_x <= 8 &&
+                       pp->input_tensors[0]->scale ==
+                          pp->output_tensors[0]->scale &&
+                       pp->input_tensors[0]->zero_point ==
+                          pp->output_tensors[0]->zero_point;
+         if (pp->pooling.type == PIPE_ML_POOLING_TYPE_MAX || ppu_ok)
+            lower_max_pooling(subgraph, pp, &operation);
          else
-            lower_pooling(subgraph, &poperations[i], &operation);
+            lower_pooling(subgraph, pp, &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
+      }
       case PIPE_ML_OPERATION_TYPE_ADD: {
          /* Fuse tensor addition into a convolution.  The host must be
           * whichever producer runs LAST in the task chain: its EW stream

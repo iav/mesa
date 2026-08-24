@@ -119,6 +119,9 @@ struct rkt_operation {
     * weights_height for the pooling kernel, padding and stride fields
     * for the rest. */
    bool is_pool;
+   /* Average pooling instead of max: OPERATION_MODE method bits 0 and the
+    * RECIP_KERNEL registers = 65536/kernel (vendor probe-AP: 7 -> 9362). */
+   bool pool_avg;
 
    unsigned input_index;
    unsigned input_width;
