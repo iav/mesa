@@ -471,6 +471,12 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
           params->activation != kTfLiteActRelu)
          return false;
 
+      if (params->weights_format !=
+             kTfLiteFullyConnectedWeightsFormatDefault ||
+          (params->activation != kTfLiteActNone &&
+           params->activation != kTfLiteActRelu))
+         return false;
+
       operation->type = PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED;
       operation->fcon.weight_tensor = &tensors[node->inputs->data[1]];
       operation->fcon.bias_tensor = &tensors[node->inputs->data[2]];
