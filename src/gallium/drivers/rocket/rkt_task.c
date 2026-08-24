@@ -127,6 +127,13 @@ fill_task(struct rkt_ml_subgraph *subgraph,
     * after the first produced nothing (op2).  Matches the vendor's FC task
     * too (mobilenet_v1 t50: 1001 -> 1008).  RKT_OUTALIGN overrides. */
    task->output_channels = align(MAX2(oc_eff, 16), 16);
+   /* Depthwise announces the full 32-wide group even when fewer channels
+    * are real (vendor probe-DW16k1: ORIG_CHANNEL=15, CHANNEL=31, CORE
+    * 0x3014=0x1f).  With the real 16 announced the whole pipeline
+    * produced nothing and the output stayed at the zero point (RE
+    * 2026-08-24, layer-dw1x1 C=16). */
+   if (operation->depthwise)
+      task->output_channels = align(MAX2(oc_eff, 32), 32);
    if (getenv("RKT_OUTALIGN")) {
       unsigned a = atoi(getenv("RKT_OUTALIGN"));
       task->output_channels = align(oc_eff, a);
