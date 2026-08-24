@@ -410,8 +410,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
    /* RK3568 vendor requant (RE 2026-08-22): 0xe0 = BS_MUL_SHIFT_VALUE_NEG=14,
-    * pairs with the shift-14 multiplier stage in BS_MUL_CFG below. */
-   EMIT(REG_DPU_DATA_FORMAT, 0);
+    * pairs with the shift-14 multiplier stage in BS_MUL_CFG below --
+    * only engaged for the per-channel full BS stream. */
+   EMIT(REG_DPU_DATA_FORMAT, operation->per_channel ? 0xe0 : 0);
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -442,22 +443,37 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * zero point all come per channel from the BRDMA coefficient stream (see
     * rkt_fill_biases).  0x148: BS_ALU_SRC=1 (bias from stream), relu bypass,
     * multiplier stage active.  0xe01: multiplier from stream, shift 14. */
-   EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x158);
-   EMIT(REG_DPU_BS_ALU_CFG, 0);
-   EMIT(REG_DPU_BS_MUL_CFG, 0);
-   EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
-
-   if (operation->depthwise) {
-      EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3) |
-                                 DPU_BS_OW_CFG_SIZE_E_1(3) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(3));
+   if (operation->per_channel) {
+      /* Full [bias][ow][mul] BS stream (vendor scheme, RE 2026-08-22):
+       * BS_CFG 0x148, multiplier from the stream with shift 14 (0xe01),
+       * OW source = stream (0x125 conv / 0x36d dw), OW_OP unused. */
+      EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG")
+                              ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16)
+                              : 0x148);
+      EMIT(REG_DPU_BS_ALU_CFG, 0);
+      emit_raw(regs, DPU | 0x1, REG_DPU_BS_MUL_CFG, 0xe01);
+      EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
+      emit_raw(regs, DPU | 0x1, REG_DPU_BS_OW_CFG,
+               operation->depthwise ? 0x36d : 0x125);
+      EMIT(REG_DPU_BS_OW_OP, 0);
    } else {
-      EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(1) |
-                                 DPU_BS_OW_CFG_SIZE_E_1(1) |
-                                 DPU_BS_OW_CFG_SIZE_E_0(1));
-   }
+      EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x158);
+      EMIT(REG_DPU_BS_ALU_CFG, 0);
+      EMIT(REG_DPU_BS_MUL_CFG, 0);
+      EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
 
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
+      if (operation->depthwise) {
+         EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3) |
+                                    DPU_BS_OW_CFG_SIZE_E_1(3) |
+                                    DPU_BS_OW_CFG_SIZE_E_0(3));
+      } else {
+         EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(1) |
+                                    DPU_BS_OW_CFG_SIZE_E_1(1) |
+                                    DPU_BS_OW_CFG_SIZE_E_0(1));
+      }
+
+      EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
+   }
 
    if (!getenv("RKT_NOWDMA")) {
       EMIT(REG_DPU_WDMA_SIZE_0,
@@ -589,18 +605,25 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * input goes through the EW RDMA (EW_BASE_ADDR below). */
    EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
 
-   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
-   /* mesa uses the per-tensor bias-only BS stream: 4 bytes per channel. */
+   /* Bias-only per-tensor stream: DATA_USE=1, 4 bytes per channel.
+    * Per-channel full stream: DATA_USE=7, 8 bytes per channel. */
+   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG,
+        DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(operation->per_channel ? 7
+                                                                      : 1));
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr +
-           task->channel_group * 32 * 4);
+           task->channel_group * 32 * (operation->per_channel ? 8 : 4));
    /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
     * and is absent from registers.xml, so mesa never writes it.  The vendor
     * stream in every .rknn writes output_channels - 1 there for all 51 tasks
     * of mobilenet_v1 (10 distinct values, all matching).  Without it the bias
     * RDMA has nothing to fetch, which matches our DT_RD being exactly 512
     * bytes (one bias buffer) short of the vendor's. */
-   emit_raw(regs, DPU_RDMA | 0x1, 0x5024, task->output_channels * 4 / 8 - 1);
+   /* 0x5024 is the BS stream length in 8-byte words minus one: 4 bytes
+    * per channel for the bias-only stream, 8 for the full per-channel
+    * triple (vendor mobilenet task 4: 64 channels, full stream, 0x3f). */
+   emit_raw(regs, DPU_RDMA | 0x1, 0x5024,
+            task->output_channels * (operation->per_channel ? 8 : 4) / 8 - 1);
    EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 1); /* bit0 = disable, as vendor */
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
 

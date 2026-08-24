@@ -145,6 +145,10 @@ struct rkt_operation {
    unsigned weights_height;
    uint8_t weights_zero_point;
    float weights_scale;
+   /* Per-channel weight quantization: the BS stream carries the full
+    * [bias][ow][mul] triple, weights_scale holds max(scales) and the
+    * per-channel remainder lives in the mul entries. */
+   bool per_channel;
 
    int add_tensor;
 
