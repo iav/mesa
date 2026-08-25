@@ -829,10 +829,17 @@ fill_upsample_regcmd(struct rkt_ml_subgraph *subgraph,
       uint32_t val = upsample_skeleton[i].val;
       switch (upsample_skeleton[i].reg) {
       case 0x4020: val = dst; break;                         /* DST_BASE_ADDR */
-      case 0x4024: val = wout * 8; break;                    /* DST_SURF_STRIDE */
+      case 0x4024: val = operation->is_dpu_copy ? out_surf : wout * 8; break; /* DST_SURF_STRIDE */
       case 0x4030: val = wout - 1; break;                    /* DATA_CUBE_WIDTH */
       case 0x4034: val = hin - 1; break;                     /* DATA_CUBE_HEIGHT: input rows, the unpooling doubles them */
-      case 0x4038: val = wout | (wout << 16); break;         /* NOTCH_ADDR */
+      case 0x4038: val = operation->is_dpu_copy ? 0 : wout | (wout << 16); break; /* NOTCH_ADDR */
+      case 0x5048: val = operation->is_dpu_copy ? 0 : val; break; /* RDMA_SRC_DMA_CFG: no unpooling for a copy */
+      /* The plain copy follows the vendor's concat-leg task (probe-C2F
+       * task 1) where it differs from the upsample probe. */
+      case 0x4010: val = operation->is_dpu_copy ? 0 : val; break;          /* DATA_FORMAT */
+      case 0x4050: val = operation->is_dpu_copy ? 2 : val; break;          /* BS_OW_CFG */
+      case 0x5014: val = operation->is_dpu_copy ? 7 : val; break;          /* RDMA cube channels - 1 */
+      case 0x5044: val = operation->is_dpu_copy ? 0x4001 : val; break;     /* RDMA_FEATURE_MODE_CFG */
       case 0x40c0: val = wout * hout * 8; break;             /* SURFACE_ADD */
       case 0x500c: val = win - 1; break;                     /* RDMA cube W */
       case 0x5010: val = hin - 1; break;                     /* RDMA cube H */
