@@ -736,11 +736,127 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    util_dynarray_append_typed(regs, uint64_t, 0x00810000001f0008);
 }
 
+/* Vendor probe-UP task 1 (RE-LOG Test 77): the DPU alone, its RDMA reading
+ * one 8-channel surface in "unpooling" mode (RDMA_SRC_DMA_CFG 0x1249: kernel
+ * 2x2, stride 2, UNPOOLING_EN) and writing the doubled surface. */
+static const struct { uint16_t target, reg; uint32_t val; } upsample_skeleton[] = {
+{ 0x1001, 0x4004, 0x0000000e },
+   { 0x2001, 0x5004, 0x0000000e },
+   { 0x1001, 0x400c, 0x00000109 },
+   { 0x1001, 0x4010, 0x04000000 },
+   { 0x1001, 0x4014, 0x00000000 },
+   { 0x1001, 0x4020, 0x00000000 },
+   { 0x1001, 0x4024, 0x000000a0 },
+   { 0x1001, 0x4030, 0x00000013 },
+   { 0x1001, 0x4034, 0x00000009 },
+   { 0x1001, 0x4038, 0x00140014 },
+   { 0x1001, 0x403c, 0x00070007 },
+   { 0x1001, 0x4040, 0x00000053 },
+   { 0x1001, 0x4044, 0x00000000 },
+   { 0x1001, 0x4048, 0x00000000 },
+   { 0x1001, 0x404c, 0x00000000 },
+   { 0x1001, 0x4050, 0x00000126 },
+   { 0x1001, 0x4054, 0x00000000 },
+   { 0x1001, 0x4060, 0x00000053 },
+   { 0x1001, 0x4064, 0x00000000 },
+   { 0x1001, 0x4068, 0x00000000 },
+   { 0x1001, 0x406c, 0x00000000 },
+   { 0x1001, 0x4070, 0x00000383 },
+   { 0x1001, 0x4074, 0x00000000 },
+   { 0x1001, 0x4078, 0x00000001 },
+   { 0x1001, 0x407c, 0x00000000 },
+   { 0x1001, 0x4080, 0x00000000 },
+   { 0x1001, 0x4084, 0x00000001 },
+   { 0x1001, 0x4088, 0x00000000 },
+   { 0x1001, 0x4090, 0x00000000 },
+   { 0x1001, 0x4094, 0x00000000 },
+   { 0x1001, 0x4098, 0x00000000 },
+   { 0x1001, 0x409c, 0x00000000 },
+   { 0x1001, 0x40a0, 0x00000000 },
+   { 0x1001, 0x40a4, 0x00000000 },
+   { 0x1001, 0x40a8, 0x00000000 },
+   { 0x1001, 0x40ac, 0x00000000 },
+   { 0x1001, 0x40c0, 0x00000c80 },
+   { 0x1001, 0x40c4, 0x00000000 },
+   { 0x1001, 0x4100, 0x00000000 },
+   { 0x1001, 0x4104, 0x00000000 },
+   { 0x1001, 0x4108, 0x00000000 },
+   { 0x1001, 0x410c, 0x00000000 },
+   { 0x1001, 0x4110, 0x00000000 },
+   { 0x1001, 0x4114, 0x00000000 },
+   { 0x1001, 0x4118, 0x00000000 },
+   { 0x1001, 0x411c, 0x00000000 },
+   { 0x1001, 0x4120, 0x00000000 },
+   { 0x1001, 0x4124, 0x00000000 },
+   { 0x1001, 0x4128, 0x00000000 },
+   { 0x1001, 0x412c, 0x00000000 },
+   { 0x2001, 0x500c, 0x00000009 },
+   { 0x2001, 0x5010, 0x00000009 },
+   { 0x2001, 0x5014, 0x00000003 },
+   { 0x2001, 0x5018, 0x00000000 },
+   { 0x2001, 0x501c, 0x00000001 },
+   { 0x2001, 0x5020, 0x00000000 },
+   { 0x2001, 0x5024, 0x00000000 },
+   { 0x2001, 0x5028, 0x00000001 },
+   { 0x2001, 0x502c, 0x00000000 },
+   { 0x2001, 0x5030, 0x00000000 },
+   { 0x2001, 0x5034, 0x00000001 },
+   { 0x2001, 0x5038, 0x00000000 },
+   { 0x2001, 0x503c, 0x00000000 },
+   { 0x2001, 0x5040, 0x00000000 },
+   { 0x2001, 0x5044, 0x0000c001 },
+   { 0x2001, 0x5048, 0x00001249 },
+   { 0x2001, 0x504c, 0x00000000 },
+   { 0x2001, 0x5064, 0x00000000 },
+   { 0x2001, 0x5068, 0x01010101 },
+};
+
+static void
+fill_upsample_regcmd(struct rkt_ml_subgraph *subgraph,
+                     const struct rkt_operation *operation,
+                     struct util_dynarray *regs, unsigned task_num)
+{
+   unsigned win = operation->input_width, hin = operation->input_height;
+   unsigned wout = operation->output_width, hout = operation->output_height;
+   unsigned in_surf = rkt_surf_px(win * hin) * 8;
+   unsigned out_surf = rkt_surf_px(wout * hout) * 8;
+   uint64_t src = rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
+                  operation->src_offset + task_num * in_surf;
+   uint64_t dst = rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
+                  operation->dst_offset + task_num * out_surf;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(upsample_skeleton); i++) {
+      uint32_t val = upsample_skeleton[i].val;
+      switch (upsample_skeleton[i].reg) {
+      case 0x4020: val = dst; break;                         /* DST_BASE_ADDR */
+      case 0x4024: val = wout * 8; break;                    /* DST_SURF_STRIDE */
+      case 0x4030: val = wout - 1; break;                    /* DATA_CUBE_WIDTH */
+      case 0x4034: val = hin - 1; break;                     /* DATA_CUBE_HEIGHT: input rows, the unpooling doubles them */
+      case 0x4038: val = wout | (wout << 16); break;         /* NOTCH_ADDR */
+      case 0x40c0: val = wout * hout * 8; break;             /* SURFACE_ADD */
+      case 0x500c: val = win - 1; break;                     /* RDMA cube W */
+      case 0x5010: val = hin - 1; break;                     /* RDMA cube H */
+      case 0x5018: val = src; break;                         /* RDMA_SRC_BASE_ADDR */
+      default: break;
+      }
+      emit_raw(regs, upsample_skeleton[i].target, upsample_skeleton[i].reg, val);
+   }
+   EMIT(REG_PC_BASE_ADDRESS, 0);
+   EMIT(REG_PC_REGISTER_AMOUNTS, 0);
+   util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
+   /* DPU + DPU_RDMA only (vendor tail 0x18). */
+   util_dynarray_append_typed(regs, uint64_t, 0x0081000000180008);
+}
+
 void
 rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
                 const struct rkt_operation *operation,
                 struct util_dynarray *regs, unsigned task_num)
 {
+   if (operation->is_upsample) {
+      fill_upsample_regcmd(subgraph, operation, regs, task_num);
+      return;
+   }
    /*
     * TODO: We should only need to set all the registers on the regcmd for the first
     * task in an operation, but for now set them all to be sure.
