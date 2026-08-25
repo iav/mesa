@@ -4,6 +4,8 @@
  */
 
 #include "rkt_task.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include "rkt_ml.h"
 
 static unsigned
@@ -413,12 +415,17 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
        * height modulo the stride -- for the 224-wide first layer of
        * mobilenet_v1 mesa fed CNA 128 rows where 63 output rows need
        * (63 - 1) * 2 + 3 = 127.  The vendor stream carries exactly 127. */
+      /* Only the top padding shortens the rows a band reads; whether the
+       * bottom padding is reached depends on the stride phase (a 3x3 s2
+       * band starting on an odd row with a top pad of 1 needs its last
+       * real row and no pad row: subtracting pad_bottom here lost the
+       * last output row of yolo's padded 320x320 first layer, Test 76).
+       * The band cannot read past its bottom slice anyway. */
       {
          unsigned consumed = (cur_task->output_height - 1) * operation->stride +
                              operation->weights_height;
-         unsigned pad = cur_task->pad_top + cur_task->pad_bottom;
 
-         consumed = consumed > pad ? consumed - pad : 0;
+         consumed = consumed > cur_task->pad_top ? consumed - cur_task->pad_top : 0;
          if (consumed > 0 && cur_task->input_height > consumed)
             cur_task->input_height = consumed;
       }
@@ -438,6 +445,12 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
       cur_task->weights_banks = available_weights_banks;
 
       output_height_processed += cur_task->output_height;
+      if (getenv("RKT_TASKS"))
+         fprintf(stderr, "rkt task %u: slices %u..%u in_h %u pad %u/%u out_h %u (in %ux%u pad %u/%u k %u s %u)\n",
+                 i, cur_task->top_slice, cur_task->bottom_slice, cur_task->input_height,
+                 cur_task->pad_top, cur_task->pad_bottom, cur_task->output_height,
+                 operation->input_width, operation->input_height, operation->padding_top,
+                 operation->padding_bottom, operation->weights_height, operation->stride);
    }
 
    /* Depthwise with C>32: duplicate every band once per 32-channel group;

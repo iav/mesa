@@ -1069,6 +1069,11 @@ struct pipe_tensor {
     */
    bool is_external_output;
    uint8_t type_size;
+   /**
+    * Number of dimensions of the tensor as the model declares it; dims
+    * is right-aligned to 4 with leading ones for lower ranks.
+    */
+   uint8_t dims_count;
 };
 
 /**

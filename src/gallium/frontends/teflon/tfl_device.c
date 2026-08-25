@@ -673,15 +673,49 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
       }
       break;
    }
+   case kTfLiteBuiltinSlice: {
+      /* SLICE(begin, size) as a strided slice with unit strides; a size
+       * of -1 runs to the end of the dimension. */
+      int *begin = tf_context->tensors[node->inputs->data[1]].data.data;
+      int *size = tf_context->tensors[node->inputs->data[2]].data.data;
+      TfLiteTensor *in = &tf_context->tensors[node->inputs->data[0]];
+      int ndims = in->dims->size;
+
+      if (ndims > 4)
+         return false;
+      operation->type = PIPE_ML_OPERATION_TYPE_STRIDED_SLICE;
+      for (int d = 0; d < ndims; d++) {
+         operation->slice.begin[d] = begin[d];
+         operation->slice.end[d] =
+            size[d] < 0 ? in->dims->data[d] : begin[d] + size[d];
+         operation->slice.strides[d] = 1;
+      }
+      break;
+   }
    case kTfLiteBuiltinStridedSlice: {
       int *begin = tf_context->tensors[node->inputs->data[1]].data.data;
       int *end = tf_context->tensors[node->inputs->data[2]].data.data;
       int *strides = tf_context->tensors[node->inputs->data[3]].data.data;
 
+      TfLiteStridedSliceParams *params = node->builtin_data;
+      TfLiteTensor *in = &tf_context->tensors[node->inputs->data[0]];
+
       operation->type = PIPE_ML_OPERATION_TYPE_STRIDED_SLICE;
       memcpy(operation->slice.begin, begin, sizeof(operation->slice.begin));
       memcpy(operation->slice.end, end, sizeof(operation->slice.end));
       memcpy(operation->slice.strides, strides, sizeof(operation->slice.strides));
+      /* begin_mask / end_mask: the dimension runs from its start / to
+       * its end; negative indices count from the end. */
+      for (int d = 0; d < in->dims->size && d < 4; d++) {
+         if (params->begin_mask & (1 << d))
+            operation->slice.begin[d] = 0;
+         else if (operation->slice.begin[d] < 0)
+            operation->slice.begin[d] += in->dims->data[d];
+         if (params->end_mask & (1 << d))
+            operation->slice.end[d] = in->dims->data[d];
+         else if (operation->slice.end[d] < 0)
+            operation->slice.end[d] += in->dims->data[d];
+      }
 
       break;
    }
@@ -911,6 +945,7 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct 
    tensor->is_constant = tf_tensor.allocation_type == kTfLiteMmapRo;
    tensor->index = index;
    fill_tensor_dims(tensor, &tf_tensor);
+   tensor->dims_count = tf_tensor.dims->size;
 
    if (tf_tensor.quantization.type == kTfLiteAffineQuantization) {
       const TfLiteAffineQuantization *quant = (const TfLiteAffineQuantization *)tf_tensor.quantization.params;
@@ -1476,6 +1511,8 @@ tflite_builtin_op_name(TfLiteBuiltinOperator op)
       return "MEAN";
    case kTfLiteBuiltinStridedSlice:
       return "STRIDED_SLICE";
+   case kTfLiteBuiltinSlice:
+      return "SLICE";
    case kTfLiteBuiltinResizeNearestNeighbor:
       return "RESIZE";
    case kTfLiteBuiltinResizeBilinear:
