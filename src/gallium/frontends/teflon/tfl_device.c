@@ -183,6 +183,10 @@ struct teflon_subgraph {
 
    unsigned *output_tensors;
    unsigned output_count;
+
+   /* Context for invoke/read_output, created once per partition: creating
+    * one per invoke cost ~2.5 ms on the rocket driver. */
+   struct pipe_context *context;
 };
 
 static void
@@ -1340,6 +1344,8 @@ partition_free(TfLiteContext *tf_context, void *buffer)
    for (unsigned i = 0; i < tsubgraph->node_count; i++)
       free_node(&tsubgraph->nodes[i]);
    free(tsubgraph->nodes);
+   if (tsubgraph->context)
+      tsubgraph->context->destroy(tsubgraph->context);
    free(tsubgraph->input_tensors);
    free(tsubgraph->output_tensors);
    free(tsubgraph);
@@ -1395,8 +1401,12 @@ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
    struct teflon_delegate *delegate = (struct teflon_delegate *)node->delegate;
    struct teflon_subgraph *tsubgraph = (struct teflon_subgraph *)node->user_data;
    struct pipe_ml_subgraph *subgraph = tsubgraph->base;
-   struct pipe_context *context = delegate->screen->context_create(delegate->screen, NULL, PIPE_CONTEXT_COMPUTE_ONLY);
    long start = 0, end = 0;
+
+   if (!tsubgraph->context)
+      tsubgraph->context = delegate->screen->context_create(
+         delegate->screen, NULL, PIPE_CONTEXT_COMPUTE_ONLY);
+   struct pipe_context *context = tsubgraph->context;
 
    if (update_partition_shapes(delegate, tf_context, tsubgraph)) {
       struct pipe_ml_subgraph *updated =
@@ -1404,10 +1414,8 @@ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
                          tsubgraph->output_tensors, tsubgraph->output_count,
                          tsubgraph->node_count, false);
 
-      if (!updated) {
-         context->destroy(context);
+      if (!updated)
          return kTfLiteError;
-      }
 
       subgraph->device->ml_subgraph_destroy(subgraph->device, subgraph);
       tsubgraph->base = updated;
@@ -1456,9 +1464,6 @@ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
       end = (long)time.tv_sec * 1000 + (long)time.tv_nsec / 1000000;
       teflon_debug("teflon: invoked graph, took %ld ms\n", (end - start));
    }
-
-   context->destroy(context);
-   context = NULL;
 
    return kTfLiteOk;
 }
