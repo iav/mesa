@@ -85,14 +85,16 @@ rkt_buffer_map(struct pipe_context *pctx,
    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
    assert(ret != -1);
 
-   uint8_t *map = os_mmap(NULL, prsc->width0, PROT_READ | PROT_WRITE, MAP_SHARED,
-                          screen->fd, rsc->fake_offset);
-   assert(map != MAP_FAILED);
+   if (rsc->cpu_map == NULL) {
+      void *map = os_mmap(NULL, prsc->width0, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, screen->fd, rsc->fake_offset);
+      assert(map != MAP_FAILED);
+      rsc->cpu_map = map;
+   }
 
-   transfer->map = map;
    *out_transfer = &transfer->base;
 
-   return map + box->x;
+   return (uint8_t *)rsc->cpu_map + box->x;
 }
 
 static void
@@ -112,7 +114,6 @@ rkt_buffer_unmap(struct pipe_context *pctx,
       assert(ret >= 0);
    }
 
-   os_munmap(transfer->map, transfer->base.resource->width0);
 
    pipe_resource_reference(&transfer->base.resource, NULL);
    ralloc_free(transfer);
@@ -184,6 +185,7 @@ rkt_resource_create(struct pipe_screen *pscreen,
       void *map = os_mmap(NULL, arg.size, PROT_READ | PROT_WRITE, MAP_SHARED,
                           screen->fd, rsc->fake_offset);
       memset(map, 0, arg.size);
+      rsc->cpu_map = map;
    }
 
    return &rsc->base;
@@ -203,6 +205,9 @@ rkt_resource_destroy(struct pipe_screen *pscreen,
    int ret;
 
    arg.handle = rsc->handle;
+
+   if (rsc->cpu_map)
+      os_munmap(rsc->cpu_map, rsc->bo_size);
 
    ret = drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &arg);
    assert(ret >= 0);
