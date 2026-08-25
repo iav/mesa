@@ -65,26 +65,20 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * regcmd (verified by BSP YOLOv5s side-by-side: slots 0-5 of BSP's
     * regcmd are S_POINTER wakes for CNA, CMAC, ACCU, then CBUF_CON0,
     * then DPU_S_POINTER, DPU_RDMA_S_POINTER). */
-   EMIT(REG_CNA_S_POINTER, CNA_S_POINTER_POINTER_PP_MODE(1) |
-                              CNA_S_POINTER_EXECUTER_PP_EN(1) |
-                              CNA_S_POINTER_POINTER_PP_EN(1));
+   uint32_t sptr = CNA_S_POINTER_POINTER_PP_MODE(1) |
+                   CNA_S_POINTER_EXECUTER_PP_EN(1) |
+                   CNA_S_POINTER_POINTER_PP_EN(1);
+   emit_raw(regs, CNA | 0x1, REG_CNA_S_POINTER, sptr);
    /* CMAC (formerly "mystery" 0x400 routing target — added to XML in this patch series). */
-   emit_raw(regs, 0x401, 0x2004, 0xe);
-   EMIT(REG_CORE_S_POINTER, CORE_S_POINTER_POINTER_PP_MODE(1) |
-                              CORE_S_POINTER_EXECUTER_PP_EN(1) |
-                              CORE_S_POINTER_POINTER_PP_EN(1));
+   emit_raw(regs, 0x401, 0x2004, sptr);
+   emit_raw(regs, CORE | 0x1, REG_CORE_S_POINTER, sptr);
 
    /* Vendor slot order (probe-D2/mobilenet_v1 streams): CNA S_PTR, CMAC
     * S_PTR, CORE S_PTR, then CBUF_CON0, THEN the DPU/DPU_RDMA wakes. */
    EMIT(REG_CNA_CBUF_CON0, con0);
 
-   EMIT(REG_DPU_S_POINTER, DPU_S_POINTER_POINTER_PP_MODE(1) |
-                              DPU_S_POINTER_EXECUTER_PP_EN(1) |
-                              DPU_S_POINTER_POINTER_PP_EN(1));
-   EMIT(REG_DPU_RDMA_RDMA_S_POINTER,
-        DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE(1) |
-           DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
-           DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
+   emit_raw(regs, DPU | 0x1, REG_DPU_S_POINTER, sptr);
+   emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_S_POINTER, sptr);
 
    EMIT(REG_CNA_CBUF_CON0, con0);
 
@@ -377,7 +371,16 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    /* RK3568 vendor requant (RE 2026-08-22): 0xe0 = BS_MUL_SHIFT_VALUE_NEG=14,
     * pairs with the shift-14 multiplier stage in BS_MUL_CFG below --
     * only engaged for the per-channel full BS stream. */
-   EMIT(REG_DPU_DATA_FORMAT, operation->per_channel ? 0xe0 : 0);
+   /* DATA_FORMAT carries the BS/BN multiplier shifts: per-channel BS
+    * stream 0xe0 (shift 14), SiLU BN multiplier shift in [10:15]
+    * (vendor 0x5000 = shift field 20). */
+   /* BN multiplier shift field: x_lut = acc * mul >> shift, the field
+    * is the shift itself on both BS paths (ramp-table probes at five
+    * LUT scales, RE-LOG Test 75). */
+   int bn_field = (int)operation->lut_shift;
+   EMIT(REG_DPU_DATA_FORMAT,
+        (operation->per_channel ? 0xe0 : 0) |
+           (operation->silu ? bn_field << 10 : 0));
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -443,7 +446,16 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_WDMA_SIZE_1,
         DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
            DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
-   if (operation->relu) {
+   if (operation->silu) {
+      /* SiLU (vendor probe-SILU conv, RE-LOG Test 73): the BN multiplier
+       * maps the accumulator into the LUT domain, x_lut = acc * mul >>
+       * shift, with the shift field one above the effective shift. */
+      emit_raw(regs, DPU | 0x1, REG_DPU_BN_CFG, 0x48);
+      EMIT(REG_DPU_BN_ALU_CFG, 0);
+      emit_raw(regs, DPU | 0x1, REG_DPU_BN_MUL_CFG,
+               (operation->lut_mul << 16) | (bn_field << 8));
+      EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
+   } else if (operation->relu) {
       /* Fused relu/relu6 the vendor way (mobilenet_v1 t0: BN_CFG 0x92,
        * RELUX_CMP 6/(si*sw)): the BN stage clamps the accumulator to
        * [0, CMP] before the EW and OUT_CVT stages.  Output saturation
@@ -466,9 +478,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
               DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
    }
-   EMIT(REG_DPU_BN_ALU_CFG, 0);
-   EMIT(REG_DPU_BN_MUL_CFG, 0);
-   if (!operation->relu)
+   if (!operation->silu) {
+      EMIT(REG_DPU_BN_ALU_CFG, 0);
+      EMIT(REG_DPU_BN_MUL_CFG, 0);
+   }
+   if (!operation->relu && !operation->silu)
       EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
 
    if (operation->add_tensor != -1) {
@@ -499,6 +513,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SHIFT(eshift) |
               DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(escale));
       EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0x0);
+   } else if (operation->silu) {
+      /* EW stage on, LUT not bypassed (vendor 0x302). */
+      emit_raw(regs, DPU | 0x1, REG_DPU_EW_CFG, 0x302);
+      EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, 0);
+      EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
+      EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
    } else {
       EMIT(REG_DPU_EW_CFG,
            DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
@@ -514,6 +534,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
       float conv_scale =
          (task->input_scale * task->weights_scale) / task->output_scale;
+      /* SiLU: OUT_CVT sees the table output, 2 * silu(x) in LUT-domain
+       * units (vendor probe-SILU: scale 0x4450 shift 0x14 decodes to
+       * 1.067 * 2^-6 = s_lut / (2 * s_out) with s_out 0.0106). */
+      if (operation->silu)
+         conv_scale = operation->lut_scale / (2.0f * task->output_scale);
       uint32_t scale_bits = fui(conv_scale);
       /* Taken from
        * https://github.com/pytorch/QNNPACK/blob/master/src/qnnpack/requantization.h#L130
@@ -560,16 +585,35 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    emit_raw(regs, DPU | 0x1, 0x40c4, 0);
    EMIT(REG_DPU_LUT_ACCESS_CFG, 0);
    EMIT(REG_DPU_LUT_ACCESS_DATA, 0);
-   EMIT(REG_DPU_LUT_CFG, 0);
-   EMIT(REG_DPU_LUT_INFO, 0);
-   EMIT(REG_DPU_LUT_LE_START, 0);
-   EMIT(REG_DPU_LUT_LE_END, 0);
-   EMIT(REG_DPU_LUT_LO_START, 0);
-   EMIT(REG_DPU_LUT_LO_END, 0);
-   EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0);
-   EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
-   EMIT(REG_DPU_LUT_LO_SLOPE_SCALE, 0);
-   EMIT(REG_DPU_LUT_LO_SLOPE_SHIFT, 0);
+   if (operation->silu) {
+      /* Vendor probe-SILU conv: index = (x - START) >> 5 (INFO 0x50500),
+       * LE over [-16384, 0], LO over [LO_START, LO_START + 16384], LO
+       * overflow slope 2.0 (0x4000 >> 13), LE underflow flat. */
+      /* LUT_CFG: the vendor writes 0x68; bit 6 (HYBRID_PRIORITY) clear
+       * gives the LE table priority where the two domains overlap, which
+       * keeps the broken first LO entries out of reach (see lower_silu). */
+      emit_raw(regs, DPU | 0x1, REG_DPU_LUT_CFG, 0x28);
+      emit_raw(regs, DPU | 0x1, REG_DPU_LUT_INFO, 0x50500);
+      EMIT(REG_DPU_LUT_LE_START, 0xffffc000);
+      EMIT(REG_DPU_LUT_LE_END, 0);
+      EMIT(REG_DPU_LUT_LO_START, (uint32_t)RKT_LUT_LO_START);
+      EMIT(REG_DPU_LUT_LO_END, (uint32_t)(0x4000 + RKT_LUT_LO_START));
+      EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0);
+      EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
+      emit_raw(regs, DPU | 0x1, REG_DPU_LUT_LO_SLOPE_SCALE, 0x40000000);
+      emit_raw(regs, DPU | 0x1, REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5);
+   } else {
+      EMIT(REG_DPU_LUT_CFG, 0);
+      EMIT(REG_DPU_LUT_INFO, 0);
+      EMIT(REG_DPU_LUT_LE_START, 0);
+      EMIT(REG_DPU_LUT_LE_END, 0);
+      EMIT(REG_DPU_LUT_LO_START, 0);
+      EMIT(REG_DPU_LUT_LO_END, 0);
+      EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0);
+      EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
+      EMIT(REG_DPU_LUT_LO_SLOPE_SCALE, 0);
+      EMIT(REG_DPU_LUT_LO_SLOPE_SHIFT, 0);
+   }
    EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
         DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,

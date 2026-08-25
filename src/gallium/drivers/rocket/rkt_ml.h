@@ -20,6 +20,15 @@
 /* RK3568 (RE 2026-08-22): 8 banks of 32 KiB, 32-byte entries (1024 per
  * bank).  Verified against all 51 mobilenet_v1 vendor tasks: data banks =
  * ceil(entries_per_slice * H / 1024), weight banks = 8 - data banks. */
+/* One DPU LUT domain for every SiLU layer: x in [-8, 8) real, one LUT
+ * unit = 1/2048, 32 units per table entry, y = 2 * silu(x) in LUT units
+ * (32767 at 8.0; beyond that the LO overflow slope continues y = 2x,
+ * below -8 silu is 0 to well under an output LSB).  The LO table starts
+ * inside the LE range because its first entries misbehave (RE-LOG
+ * Test 75). */
+#define RKT_LUT_SCALE    (1.0f / 2048.0f)
+#define RKT_LUT_LO_START (-512)
+
 #define CBUF_BANK_SIZE        32768
 /* CBUF_BANKS is SoC-specific:
  *   RK3588: 12 banks (384 KiB CBUF)
@@ -159,6 +168,21 @@ struct rkt_operation {
    unsigned dst_offset;
 
    struct util_dynarray tasks; /* struct split_task */
+
+   /* Fused x * sigmoid(x) (SiLU) through the DPU lookup table (vendor
+    * ConvExSwish, RE-LOG Tests 73/75): the convolution runs the BN
+    * multiplier + LUT + OUT_CVT path instead of the bypass; the tables
+    * themselves reach the unit through the kernel (drm_rocket_job
+    * lut_data). */
+   bool silu;
+   /* Value of one LUT-domain unit (the table spans [-16384, 16384]). */
+   float lut_scale;
+   /* BN multiplier mapping the accumulator into the LUT domain:
+    * x_lut = acc * lut_mul >> lut_shift. */
+   unsigned lut_mul;
+   unsigned lut_shift;
+   int16_t lut_le[513];
+   int16_t lut_lo[513];
 };
 
 /* Dimensions of a concatenation output tensor.  Several operations then
@@ -178,6 +202,11 @@ struct rkt_ml_subgraph {
    struct util_dynarray operations; /* rkt_operation */
    struct util_dynarray tensors;    /* pipe_resource* */
    struct util_dynarray concat_shapes; /* rkt_concat_shape */
+   /* DPU lookup tables handed to the kernel with the job (LE then LO,
+    * 515 words each): every SiLU convolution shares the one table in
+    * the global LUT domain. */
+   bool has_lut;
+   uint16_t lut_words[1030];
 };
 
 /* RK3568 feature surfaces are padded to whole 32-byte CBUF entries: the

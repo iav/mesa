@@ -134,9 +134,24 @@ struct drm_rocket_job {
 	__u32 last_int_mask;
 
 	/**
-	 * @pad: Reserved, must be zero.
+	 * @lut_data: Input: Optional pointer to the DPU lookup-table contents
+	 * to program before the job starts: @lut_count 16-bit words, the LE
+	 * table (x < 0) first and the LO table (x >= 0) second, each in the
+	 * hardware's 515-word framing (a leading word, 513 entries, one
+	 * trailing word).  The tables are written through the register
+	 * interface while the unit is idle; they stay until rewritten.
 	 */
-	__u32 pad;
+	__u64 lut_data;
+
+	/**
+	 * @lut_count: Input: Number of 16-bit words at @lut_data (0 or 1030).
+	 */
+	__u32 lut_count;
+
+	/**
+	 * @pad2: Reserved, must be zero.
+	 */
+	__u32 pad2;
 };
 
 /**
