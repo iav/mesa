@@ -235,6 +235,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            CNA_PAD_CON0_PAD_LEFT(task->pad_left) |
            CNA_PAD_CON0_PAD_TOP(task->pad_top));
    EMIT(REG_CNA_FEATURE_DATA_ADDR,
+        operation->src_offset +
         rkt_get_tensor(subgraph, operation->input_index)->phys_addr +
            task->input_offset +
            task->channel_group *
@@ -655,7 +656,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       emit_raw(regs, DPU_RDMA | 0x1, REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000000);
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
            rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr +
-              task->output_offset);
+              operation->add_src_offset + task->output_offset);
       /* The second-input tensor keeps full-height surfaces regardless of
        * banding, so the EW surface stride spans the full tensor height
        * even on a band task (vendor probe-ADDB: 0x6200 on both bands of a

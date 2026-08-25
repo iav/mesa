@@ -209,6 +209,41 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
    free(regcfgs);
 }
 
+static struct rkt_view *
+find_view(struct rkt_ml_subgraph *subgraph, unsigned index)
+{
+   util_dynarray_foreach (&subgraph->views, struct rkt_view, v)
+      if (v->index == index)
+         return v;
+   return NULL;
+}
+
+/* Replace a view input by its source: a channel slice becomes a surface
+ * offset into the source tensor, a spatial pad becomes convolution
+ * padding.  Views can nest (a slice of a pad, a pad of a slice). */
+static void
+resolve_views(struct rkt_ml_subgraph *subgraph, struct rkt_operation *op)
+{
+   struct rkt_view *v;
+
+   while ((v = find_view(subgraph, op->input_index)) != NULL) {
+      if (v->is_pad) {
+         op->input_width = v->src_width;
+         op->input_height = v->src_height;
+         op->padding_top += v->pad_top;
+         op->padding_bottom += v->pad_bottom;
+         op->padding_left += v->pad_left;
+         op->padding_right += v->pad_right;
+      } else {
+         unsigned surf =
+            rkt_surf_px(op->input_width * op->input_height) * 8;
+         op->src_offset += (v->ch_off / 8) * surf;
+         op->src_channels = v->src_channels;
+      }
+      op->input_index = v->src_index;
+   }
+}
+
 static void
 lower_convolution(struct rkt_ml_subgraph *subgraph,
                   const struct pipe_ml_operation *poperation,
@@ -237,6 +272,9 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->input_channels = poperation->input_tensors[0]->dims[3];
    operation->input_zero_point = poperation->input_tensors[0]->zero_point;
    operation->input_scale = poperation->input_tensors[0]->scale;
+   operation->src_channels = operation->input_channels;
+   operation->src_offset = 0;
+   resolve_views(subgraph, operation);
 
    operation->output_index = poperation->output_tensors[0]->index;
    operation->output_width = poperation->output_tensors[0]->dims[2];
@@ -333,6 +371,8 @@ lower_max_pooling(struct rkt_ml_subgraph *subgraph,
    operation->input_width = ppool->input_tensors[0]->dims[2];
    operation->input_height = ppool->input_tensors[0]->dims[1];
    operation->input_channels = ppool->input_tensors[0]->dims[3];
+   operation->src_channels = operation->input_channels;
+   resolve_views(subgraph, operation);
    operation->input_zero_point = ppool->input_tensors[0]->zero_point;
    operation->input_scale = ppool->input_tensors[0]->scale;
 
@@ -553,7 +593,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
 }
 
 static bool
-tensor_quantization_supported(struct pipe_tensor *tensor)
+tensor_quantization_supported(const struct pipe_tensor *tensor)
 {
    /*
     * Per-axis quantization not supported, for details see:
@@ -567,6 +607,29 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                            const struct pipe_ml_operation *operation)
 {
    bool supported = false;
+
+   /* Everything here is NHWC feature-map arithmetic; lower-rank tensors
+    * (yolo's [1, 84, 2100] tail) arrive right-aligned to 4 dims and
+    * would be misread as tiny maps with thousands of channels. */
+   for (unsigned k = 0; k < operation->input_count; k++)
+      if (operation->input_tensors[k]->data == NULL &&
+          operation->input_tensors[k]->dims_count != 4)
+         return false;
+   for (unsigned k = 0; k < operation->output_count; k++)
+      if (operation->output_tensors[k]->dims_count != 4)
+         return false;
+   /* The CNA/CORE width and height fields are 11 bits (DATAIN_WIDTH,
+    * DATAOUT_WIDTH ...): yolo's DFL convolution over a 4x2100 map came
+    * out scrambled (layer-w2100 probes, Test 76). */
+   for (unsigned k = 0; k < operation->input_count; k++)
+      if (operation->input_tensors[k]->data == NULL &&
+          (operation->input_tensors[k]->dims[1] > 2047 ||
+           operation->input_tensors[k]->dims[2] > 2047))
+         return false;
+   for (unsigned k = 0; k < operation->output_count; k++)
+      if (operation->output_tensors[k]->dims[1] > 2047 ||
+          operation->output_tensors[k]->dims[2] > 2047)
+         return false;
 
    switch (operation->type) {
    case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
@@ -609,6 +672,56 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       supported = operation->input_tensors[0]->data == NULL &&
                   operation->input_tensors[1]->data == NULL;
       break;
+   case PIPE_ML_OPERATION_TYPE_QUANTIZE: {
+      /* int8/uint8 -> int8/uint8 requantization (TFLite puts one on
+       * every concat leg whose scale differs from the concat's): folded
+       * into the producer's OUT_CVT when it is the only consumer, an
+       * identity convolution otherwise. */
+      const struct pipe_tensor *in = operation->input_tensors[0];
+      const struct pipe_tensor *out = operation->output_tensors[0];
+      supported = tensor_quantization_supported(in) &&
+                  tensor_quantization_supported(out) &&
+                  in->type_size == 1 && out->type_size == 1 &&
+                  in->dims[1] == out->dims[1] && in->dims[2] == out->dims[2] &&
+                  in->dims[3] == out->dims[3] && in->dims[3] > 0;
+      break;
+   }
+   case PIPE_ML_OPERATION_TYPE_PAD:
+      /* Spatial zero-point padding folded into the consuming
+       * convolution (yolo's explicit PAD before stride-2 convs). */
+      supported = operation->input_tensors[0]->type_size == 1 &&
+                  operation->input_tensors[0]->dims[3] > 0 &&
+                  operation->pad.before_z == 0 && operation->pad.after_z == 0 &&
+                  operation->pad.before_x <= 7 && operation->pad.after_x <= 7 &&
+                  operation->pad.before_y <= 7 && operation->pad.after_y <= 7 &&
+                  tensor_quantization_supported(operation->input_tensors[0]) &&
+                  operation->input_tensors[0]->scale ==
+                     operation->output_tensors[0]->scale &&
+                  operation->input_tensors[0]->zero_point ==
+                     operation->output_tensors[0]->zero_point;
+      break;
+   case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE: {
+      /* A channel slice on an 8-channel surface boundary is pure
+       * addressing for the consumer. */
+      const struct pipe_tensor *in = operation->input_tensors[0];
+      const struct pipe_tensor *out = operation->output_tensors[0];
+      supported = in->dims[3] > 0 && out->dims[3] > 0 && in->type_size == 1 &&
+                  operation->slice.begin[0] == 0 &&
+                  operation->slice.begin[1] == 0 &&
+                  operation->slice.begin[2] == 0 &&
+                  operation->slice.end[1] == (int)in->dims[1] &&
+                  operation->slice.end[2] == (int)in->dims[2] &&
+                  operation->slice.begin[3] % 8 == 0 &&
+                  operation->slice.end[3] - operation->slice.begin[3] ==
+                     (int)out->dims[3] &&
+                  operation->slice.strides[0] == 1 &&
+                  operation->slice.strides[1] == 1 &&
+                  operation->slice.strides[2] == 1 &&
+                  operation->slice.strides[3] == 1 &&
+                  tensor_quantization_supported(in) &&
+                  in->scale == out->scale && in->zero_point == out->zero_point;
+      break;
+   }
    case PIPE_ML_OPERATION_TYPE_LOGISTIC:
    case PIPE_ML_OPERATION_TYPE_MUL:
       /* Only as the two halves of conv -> x * sigmoid(x) (SiLU), fused
@@ -800,16 +913,18 @@ lower_silu(struct rkt_ml_subgraph *subgraph, struct rkt_operation *host,
                               -32768, 32767);
    }
 
-   /* The job's LUT payload in the hardware framing: a leading word, the
-    * 513 entries, entry 1 again (vendor loader streams, Test 73). */
+   /* The job's LUT payload: entry i at word i (the unit indexes the
+    * table by (x - START) >> 5 straight into the word array; the
+    * vendor's leading zero word puts every entry one bin late, which
+    * costs it ~1.3 LSB on the steep positive branch), the two trailing
+    * words repeat the last entry. */
    if (!subgraph->has_lut) {
       const int16_t *tabs[2] = {host->lut_le, host->lut_lo};
       for (unsigned t = 0; t < 2; t++) {
          uint16_t *w = &subgraph->lut_words[t * 515];
-         w[0] = 0;
          for (unsigned i = 0; i < 513; i++)
-            w[1 + i] = (uint16_t)tabs[t][i];
-         w[514] = (uint16_t)tabs[t][1];
+            w[i] = (uint16_t)tabs[t][i];
+         w[513] = w[514] = (uint16_t)tabs[t][512];
       }
       subgraph->has_lut = true;
    }
@@ -860,6 +975,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    subgraph->tensors = UTIL_DYNARRAY_INIT;
    subgraph->operations = UTIL_DYNARRAY_INIT;
    subgraph->concat_shapes = UTIL_DYNARRAY_INIT;
+   subgraph->views = UTIL_DYNARRAY_INIT;
    if (!util_dynarray_resize(&subgraph->tensors, struct pipe_resource *,
                              tensor_count))
       return NULL;
@@ -869,6 +985,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    for (int i = 0; i < count; i++) {
       struct rkt_operation operation = {0};
       operation.add_tensor = -1;
+      operation.orig_output_index = -1;
 
       switch (poperations[i].type) {
       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
@@ -1037,12 +1154,15 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          }
 
          /* A depthwise host reads the EW operand with the wrong surface
-          * walk (see lower_identity_copy); when the other producer is a
-          * regular convolution AND runs later in the chain it can host
+          * walk (see lower_identity_copy), and a SiLU host has its EW
+          * stage taken by the lookup table (yolo bottleneck: add(b,
+          * silu(conv(...)))); when the other producer is a regular,
+          * non-SiLU convolution AND runs later in the chain it can host
           * instead, otherwise fall back to a pointwise identity copy of
-          * the depthwise output hosting the add. */
-         if (host->depthwise) {
-            if (other_op && !other_op->depthwise && other_op > host) {
+          * the output hosting the add. */
+         if (host->depthwise || host->silu) {
+            if (other_op && !other_op->depthwise && !other_op->silu &&
+                other_op > host) {
                struct rkt_operation *t = host;
                host = other_op;
                other_op = t;
@@ -1069,8 +1189,21 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          }
 
          if (other_op == NULL) {
-            /* Graph input */
-            host->add_tensor = other->index;
+            /* Graph input, or a channel slice (view) of a tensor: the EW
+             * stream reads the source at the surface offset. */
+            unsigned idx = other->index, off = 0;
+            struct rkt_view *v;
+            while ((v = find_view(subgraph, idx)) != NULL) {
+               assert(!v->is_pad);
+               off += (v->ch_off / 8) *
+                      rkt_surf_px(host->output_width * host->output_height) * 8;
+               idx = v->src_index;
+            }
+            host->add_tensor = idx;
+            host->add_src_offset = off;
+            struct rkt_operation *src_op = find_producer(subgraph, idx);
+            if (src_op != NULL)
+               src_op->addition_input = true;
          } else {
             other_op->addition_input = true;
             host->add_tensor = other_op->output_index;
@@ -1090,6 +1223,60 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
          break;
       }
+      case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE: {
+         const struct pipe_ml_operation *ps = &poperations[i];
+         struct rkt_view v = {
+            .index = ps->output_tensors[0]->index,
+            .src_index = ps->input_tensors[0]->index,
+            .ch_off = ps->slice.begin[3],
+            .channels = ps->output_tensors[0]->dims[3],
+            .src_channels = ps->input_tensors[0]->dims[3],
+         };
+         util_dynarray_append(&subgraph->views, v);
+         break;
+      }
+      case PIPE_ML_OPERATION_TYPE_PAD: {
+         const struct pipe_ml_operation *pp = &poperations[i];
+         /* teflon: before/after_x pad dims[1] (height), _y dims[2]. */
+         struct rkt_view v = {
+            .index = pp->output_tensors[0]->index,
+            .src_index = pp->input_tensors[0]->index,
+            .is_pad = true,
+            .src_width = pp->input_tensors[0]->dims[2],
+            .src_height = pp->input_tensors[0]->dims[1],
+            .pad_top = pp->pad.before_x,
+            .pad_bottom = pp->pad.after_x,
+            .pad_left = pp->pad.before_y,
+            .pad_right = pp->pad.after_y,
+         };
+         util_dynarray_append(&subgraph->views, v);
+         break;
+      }
+      case PIPE_ML_OPERATION_TYPE_QUANTIZE: {
+         const struct pipe_ml_operation *pq = &poperations[i];
+         const struct pipe_tensor *in = pq->input_tensors[0];
+         const struct pipe_tensor *out = pq->output_tensors[0];
+         struct rkt_operation *prod = find_producer(subgraph, in->index);
+
+         if (prod != NULL &&
+             concat_is_sole_consumer(poperations, count, i, in->index)) {
+            /* Retarget the producer: it requantizes into the QUANTIZE
+             * output's domain and writes that tensor directly. */
+            prod->orig_output_index = prod->output_index;
+            prod->orig_output_zero_point = prod->output_zero_point;
+            prod->orig_output_scale = prod->output_scale;
+            prod->output_index = out->index;
+            prod->output_zero_point = out->zero_point;
+            prod->output_scale = out->scale;
+         } else {
+            struct rkt_operation copy = {0};
+            copy.add_tensor = -1;
+            lower_identity_copy(subgraph, pq->input_tensors[0], out, 0, false,
+                                &copy);
+            util_dynarray_append(&subgraph->operations, copy);
+         }
+         break;
+      }
       case PIPE_ML_OPERATION_TYPE_LOGISTIC:
          /* Half of a SiLU pattern (rkt_ml_operation_supported): folded
           * into the convolution when its MUL comes by. */
@@ -1100,7 +1287,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          struct rkt_operation *host = NULL;
          for (unsigned k = 0; k < 2 && host == NULL; k++)
             host = find_producer(subgraph, poperations[i].input_tensors[k]->index);
-         assert(host && !host->silu && host->add_tensor == -1 && !host->relu);
+         assert(host && !host->silu && host->add_tensor == -1 && !host->relu &&
+                !host->addition_input);
          lower_silu(subgraph, host, poperations[i].output_tensors[0]);
          break;
       }
@@ -1114,7 +1302,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
                           operation) {
       unsigned input_channels_1 =
-         DIV_ROUND_UP(operation->input_channels, FEATURE_ATOMIC_SIZE) * 2;
+         DIV_ROUND_UP(operation->src_channels, FEATURE_ATOMIC_SIZE) * 2;
       unsigned input_channels_2 = FEATURE_ATOMIC_SIZE;
       unsigned input_size =
          rkt_surf_px(operation->input_width * operation->input_height) *
@@ -1250,7 +1438,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       struct pipe_resource *input =
          &rkt_get_tensor(subgraph, input_idxs[i])->base;
       unsigned input_channels =
-         addition_feed ? operation->output_channels : operation->input_channels;
+         addition_feed ? operation->output_channels : operation->src_channels;
       unsigned output_channels = operation->output_channels;
 
       struct rkt_resource *input_tensor = rkt_get_tensor(
@@ -1505,6 +1693,10 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          job.out_bo_handle_count = 1;
          job.tasks = (uint64_t)tasks;
          job.task_count = task_count;
+         if (subgraph->has_lut) {
+            job.lut_data = (uint64_t)(uintptr_t)subgraph->lut_words;
+            job.lut_count = 1030;
+         }
 
          /* RK3568 PC task-DMA mode (vendor rknpu_job): build the 40-byte
           * descriptor array so the PC unit walks the whole chain itself --
@@ -1591,10 +1783,35 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
    DBG("Processing output\n");
 
    for (int i = 0; i < outputs_count; i++) {
+      unsigned idx = output_idxs[i];
+      unsigned ch_off = 0, view_channels = 0;
+      struct rkt_view *v;
 
-      struct rkt_operation *operation = find_producer(subgraph, output_idxs[i]);
-      struct rkt_resource *output_tensor =
-         rkt_get_tensor(subgraph, output_idxs[i]);
+      /* A partition output that is a channel slice of a tensor: read
+       * the source at the surface offset. */
+      while ((v = find_view(subgraph, idx)) != NULL) {
+         assert(!v->is_pad);
+         ch_off += v->ch_off;
+         if (!view_channels)
+            view_channels = v->channels;
+         idx = v->src_index;
+      }
+
+      struct rkt_operation *operation = find_producer(subgraph, idx);
+      /* A producer whose QUANTIZE was folded in still has to serve the
+       * pre-quantization tensor when the partition exports it. */
+      bool requant = false;
+      if (operation == NULL) {
+         util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
+            if (op->orig_output_index == (int)idx) {
+               operation = op;
+               requant = true;
+               idx = op->output_index;
+               break;
+            }
+      }
+      assert(operation != NULL);
+      struct rkt_resource *output_tensor = rkt_get_tensor(subgraph, idx);
       struct pipe_transfer *transfer = NULL;
       uint8_t *raw_output;
       unsigned out_w = operation->output_width;
@@ -1605,13 +1822,15 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
        * its own slice -- the full dims live in the shape table. */
       util_dynarray_foreach (&subgraph->concat_shapes,
                              struct rkt_concat_shape, cs) {
-         if (cs->index == output_idxs[i]) {
+         if (cs->index == idx) {
             out_w = cs->width;
             out_h = cs->height;
             out_c = cs->channels;
             break;
          }
       }
+      if (view_channels)
+         out_c = view_channels;
       /* RK3568 DPU output layout (RE 2026-08-22, layer-c28 quadrant map):
        * surfaces of 8 channels, 8 bytes per pixel, surface stride
        * Wout * Hout * 8 -- matches the vendor DST_SURF_STRIDE (0x1880 =
@@ -1643,13 +1862,22 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          /* An INT8 user buffer wants q_i8 = q_u8 XOR 0x80 (the driver
           * domain is uint8, see subgraph_invoke). */
          uint8_t fold = is_signed[i] ? 0x80 : 0;
+         raw += (ch_off / 8) * surf;
+         float rq_scale = requant ? operation->output_scale /
+                                       operation->orig_output_scale
+                                  : 1.0f;
          for (int oc = 0; oc < out_c; oc++) {
             unsigned g = oc / 8, c = oc % 8;
             for (unsigned y = 0; y < rows; y++) {
                for (unsigned x = 0; x < cols; x++) {
-                  output_out[y][x][oc] =
-                     (uint8_t)(raw[g * surf + (y * cols + x) * 8 + c] + 0x80) ^
-                     fold;
+                  uint8_t q = raw[g * surf + (y * cols + x) * 8 + c] + 0x80;
+                  if (requant) {
+                     float r = (float)operation->orig_output_zero_point +
+                               ((int)q - (int)operation->output_zero_point) *
+                                  rq_scale;
+                     q = (uint8_t)CLAMP(lrintf(r), 0, 255);
+                  }
+                  output_out[y][x][oc] = q ^ fold;
                }
             }
          }
@@ -1688,6 +1916,7 @@ rkt_ml_subgraph_destroy(struct pipe_ml_device *pdevice,
          pipe_resource_reference(tensor, NULL);
    util_dynarray_fini(&subgraph->tensors);
    util_dynarray_fini(&subgraph->concat_shapes);
+   util_dynarray_fini(&subgraph->views);
 
    free(subgraph);
 }

@@ -160,12 +160,25 @@ struct rkt_operation {
    bool per_channel;
 
    int add_tensor;
+   /* Surface offset into add_tensor when the operand is a channel slice. */
+   unsigned add_src_offset;
 
    /* Byte offset added to the output tensor's base address.  Channel
     * concatenation writes each producer into its slice of the shared
     * output BO: in the planar 8-channel surface layout a producer's
     * surfaces are self-contained, so the concat is just a base offset. */
    unsigned dst_offset;
+   /* The mirror image for the input: a channel SLICE of a tensor is a
+    * surface offset into it (src_offset, bytes); the tensor read holds
+    * src_channels channels, of which input_channels are consumed. */
+   unsigned src_offset;
+   unsigned src_channels;
+   /* A QUANTIZE folded into this producer: the tensor it used to write
+    * and that tensor's quantization, so a partition output that still
+    * wants the old tensor can be requantized on the CPU. */
+   int orig_output_index;
+   unsigned orig_output_zero_point;
+   float orig_output_scale;
 
    struct util_dynarray tasks; /* struct split_task */
 
@@ -195,6 +208,24 @@ struct rkt_concat_shape {
    unsigned channels;
 };
 
+/* A tensor that is a view of another one rather than a buffer of its
+ * own: the output of a channel SLICE (surface offset) or of a spatial
+ * PAD (the consumer pads instead).  Resolved when the consumer is
+ * lowered; no operation is emitted for the view itself. */
+struct rkt_view {
+   unsigned index;
+   unsigned src_index;
+   bool is_pad;
+   /* slice */
+   unsigned ch_off;
+   unsigned channels;
+   unsigned src_channels;
+   /* pad */
+   unsigned src_width;
+   unsigned src_height;
+   unsigned pad_top, pad_bottom, pad_left, pad_right;
+};
+
 struct rkt_ml_subgraph {
    struct pipe_ml_subgraph base;
 
@@ -202,6 +233,7 @@ struct rkt_ml_subgraph {
    struct util_dynarray operations; /* rkt_operation */
    struct util_dynarray tensors;    /* pipe_resource* */
    struct util_dynarray concat_shapes; /* rkt_concat_shape */
+   struct util_dynarray views;         /* rkt_view */
    /* DPU lookup tables handed to the kernel with the job (LE then LO,
     * 515 words each): every SiLU convolution shares the one table in
     * the global LUT domain. */
