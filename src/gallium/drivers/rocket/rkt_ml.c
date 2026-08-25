@@ -722,6 +722,18 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                   in->scale == out->scale && in->zero_point == out->zero_point;
       break;
    }
+   case PIPE_ML_OPERATION_TYPE_RESIZE: {
+      /* Nearest-neighbour 2x (yolo's neck upsamples): DPU unpooling. */
+      const struct pipe_tensor *in = operation->input_tensors[0];
+      const struct pipe_tensor *out = operation->output_tensors[0];
+      supported = in->type_size == 1 && in->dims[3] > 0 &&
+                  out->dims[1] == 2 * in->dims[1] &&
+                  out->dims[2] == 2 * in->dims[2] &&
+                  out->dims[3] == in->dims[3] &&
+                  tensor_quantization_supported(in) &&
+                  in->scale == out->scale && in->zero_point == out->zero_point;
+      break;
+   }
    case PIPE_ML_OPERATION_TYPE_LOGISTIC:
    case PIPE_ML_OPERATION_TYPE_MUL:
       /* Only as the two halves of conv -> x * sigmoid(x) (SiLU), fused
@@ -1078,10 +1090,10 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
             if (prod != NULL &&
                 concat_is_sole_consumer(poperations, count, i, in->index) &&
-                !(prod->is_pool && requant)) {
+                !((prod->is_pool || prod->is_upsample) && requant)) {
                prod->output_index = out->index;
                prod->dst_offset = dst_offset;
-               if (!prod->is_pool) {
+               if (!prod->is_pool && !prod->is_upsample) {
                   prod->output_zero_point = out->zero_point;
                   prod->output_scale = out->scale;
                }
@@ -1223,6 +1235,35 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
          break;
       }
+      case PIPE_ML_OPERATION_TYPE_RESIZE: {
+         const struct pipe_ml_operation *pr = &poperations[i];
+         const struct pipe_tensor *in = pr->input_tensors[0];
+         const struct pipe_tensor *out = pr->output_tensors[0];
+         operation.is_upsample = true;
+         operation.tasks = UTIL_DYNARRAY_INIT;
+         operation.input_index = in->index;
+         operation.input_width = in->dims[2];
+         operation.input_height = in->dims[1];
+         operation.input_channels = in->dims[3];
+         operation.input_zero_point = in->zero_point;
+         operation.input_scale = in->scale;
+         operation.src_channels = operation.input_channels;
+         operation.output_index = out->index;
+         operation.output_width = out->dims[2];
+         operation.output_height = out->dims[1];
+         operation.output_channels = out->dims[3];
+         operation.output_zero_point = out->zero_point;
+         operation.output_scale = out->scale;
+         resolve_views(subgraph, &operation);
+         for (unsigned s = 0; s < DIV_ROUND_UP(operation.input_channels, 8); s++) {
+            struct split_task task = {0};
+            task.num = s;
+            task.channel_group = s;
+            util_dynarray_append(&operation.tasks, task);
+         }
+         util_dynarray_append(&subgraph->operations, operation);
+         break;
+      }
       case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE: {
          const struct pipe_ml_operation *ps = &poperations[i];
          struct rkt_view v = {
@@ -1258,10 +1299,14 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          const struct pipe_tensor *out = pq->output_tensors[0];
          struct rkt_operation *prod = find_producer(subgraph, in->index);
 
+         bool same_quant = in->scale == out->scale &&
+                           in->zero_point == out->zero_point;
          if (prod != NULL &&
-             concat_is_sole_consumer(poperations, count, i, in->index)) {
+             concat_is_sole_consumer(poperations, count, i, in->index) &&
+             (same_quant || !(prod->is_pool || prod->is_upsample))) {
             /* Retarget the producer: it requantizes into the QUANTIZE
-             * output's domain and writes that tensor directly. */
+             * output's domain and writes that tensor directly (a PPU
+             * pool or DPU upsample cannot requantize: copy instead). */
             prod->orig_output_index = prod->output_index;
             prod->orig_output_zero_point = prod->output_zero_point;
             prod->orig_output_scale = prod->output_scale;
@@ -1356,7 +1401,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                pool = next;
             }
          }
-         rkt_split_tasks(subgraph, operation);
+         if (!operation->is_upsample)
+            rkt_split_tasks(subgraph, operation);
          compile_operation(subgraph, operation, pool);
       }
    }
@@ -1569,7 +1615,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       uint32_t last_int_mask = last_op->is_pool ? pool_int_mask : 0x300;
 
       struct drm_rocket_task *tasks = calloc(total_tasks, sizeof(*tasks));
-      bool *task_is_pool = calloc(total_tasks, sizeof(bool));
+      /* 0 convolution stream, 1 PPU pool chunk, 2 DPU-only upsample. */
+      uint8_t *task_is_pool = calloc(total_tasks, sizeof(uint8_t));
       uint32_t *in_bo_handles = calloc(num_ops * 2, sizeof(uint32_t));
       uint32_t *out_bo_handles = calloc(num_ops, sizeof(uint32_t));
       unsigned num_inputs = 0, num_outputs = 0, ti = 0;
@@ -1579,7 +1626,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          util_dynarray_foreach (&op->tasks, struct split_task, task) {
             tasks[ti].regcmd = task->regcfg_addr;
             tasks[ti].regcmd_count = task->regcfg_amount;
-            task_is_pool[ti] = op->is_pool;
+            task_is_pool[ti] = op->is_pool ? 1 : op->is_upsample ? 2 : 0;
             ti++;
          }
 
@@ -1620,8 +1667,9 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       for (unsigned k = 0; k < total_tasks; k++) {
          d[k].flags = 0;
          d[k].op_idx = k + 1;
-         d[k].enable_mask = task_is_pool[k] ? 0x60 : 0x1f;
-         d[k].int_mask = task_is_pool[k] ? 0xc00 : 0x300;
+         d[k].enable_mask = task_is_pool[k] == 1 ? 0x60
+                            : task_is_pool[k] == 2 ? 0x18 : 0x1f;
+         d[k].int_mask = task_is_pool[k] == 1 ? 0xc00 : 0x300;
          d[k].int_clear = 0x1ffff;
          d[k].int_status = 0;
          /* The vendor descriptor amount excludes the 4-word PC tail

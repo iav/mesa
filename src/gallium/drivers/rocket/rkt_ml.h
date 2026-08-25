@@ -128,6 +128,9 @@ struct rkt_operation {
     * weights_height for the pooling kernel, padding and stride fields
     * for the rest. */
    bool is_pool;
+   /* Nearest-neighbour 2x upsample: one DPU-only task per 8-channel
+    * surface, DPU_RDMA "unpooling" mode (vendor Resize, RE-LOG Test 77). */
+   bool is_upsample;
    /* Average pooling instead of max: OPERATION_MODE method bits 0 and the
     * RECIP_KERNEL registers = 65536/kernel (vendor probe-AP: 7 -> 9362). */
    bool pool_avg;
