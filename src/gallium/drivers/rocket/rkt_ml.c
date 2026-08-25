@@ -8,6 +8,7 @@
 #include "util/u_dynarray.h"
 #include "util/u_inlines.h"
 
+#include <math.h>
 #include <xf86drm.h>
 
 #include "drm-uapi/rocket_accel.h"
@@ -132,6 +133,7 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
       pipe_buffer_map(pcontext, operation->regcmd, PIPE_MAP_WRITE, &transfer);
 
    unsigned regcmd_offset = 0;
+
    for (int i = 0; i < num_tasks; i++) {
       unsigned size = util_dynarray_num_elements(&regcfgs[i], uint64_t);
       struct split_task *task =
@@ -526,6 +528,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
          tensor_count = MAX2(tensor_count, poperation->conv.bias_tensor->index);
          break;
       case PIPE_ML_OPERATION_TYPE_ADD:
+      case PIPE_ML_OPERATION_TYPE_MUL:
          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING:
@@ -605,6 +608,15 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
    case PIPE_ML_OPERATION_TYPE_ADD:
       supported = operation->input_tensors[0]->data == NULL &&
                   operation->input_tensors[1]->data == NULL;
+      break;
+   case PIPE_ML_OPERATION_TYPE_LOGISTIC:
+   case PIPE_ML_OPERATION_TYPE_MUL:
+      /* Only as the two halves of conv -> x * sigmoid(x) (SiLU), fused
+       * into the convolution through the DPU lookup table (vendor
+       * ConvExSwish, RE-LOG Test 73).  Teflon establishes the pattern. */
+      supported = operation->silu_pattern &&
+                  tensor_quantization_supported(operation->input_tensors[0]) &&
+                  tensor_quantization_supported(operation->output_tensors[0]);
       break;
    case PIPE_ML_OPERATION_TYPE_POOLING:
       /* Average pooling runs as a depthwise convolution with constant
@@ -735,6 +747,72 @@ fused_add_pad(const struct pipe_ml_operation *poperations, unsigned count,
          return align(c, 32);
    }
    return 0;
+}
+
+static float
+silu_f(float x)
+{
+   return x / (1.0f + expf(-x));
+}
+
+/* Fuse x * sigmoid(x) into the convolution: the DPU BN multiplier maps
+ * the accumulator into the LUT domain [-16384, 16384] (513 entries per
+ * table, one entry per 32 units, LUT_INFO index_select 5), the LE table
+ * covers x < 0 and LO x >= 0, the LO overflow slope continues y = 2x
+ * above the domain, OUT_CVT requantizes the table output.  Domain and
+ * scales follow the vendor probe-SILU stream (RE-LOG Test 73): the LUT
+ * spans the largest value the output tensor can hold (silu(x) -> x),
+ * the table output is 2 * silu(x) in LUT-domain units. */
+/* One LUT domain for every layer: x in [-8, 8) real, 32 LUT units =
+ * 1/64 per table entry, y = 2 * silu(x) in LUT units (max 32767 at 8.0).
+ * Beyond +8 the LO overflow slope continues y = 2x; below -8 silu is 0
+ * to well under one output LSB. */
+static void
+lower_silu(struct rkt_ml_subgraph *subgraph, struct rkt_operation *host,
+           const struct pipe_tensor *out)
+{
+   host->silu = true;
+   host->output_index = out->index;
+   host->output_zero_point = out->zero_point;
+   host->output_scale = out->scale;
+
+   float s_acc = host->input_scale * host->weights_scale;
+   host->lut_scale = RKT_LUT_SCALE;
+
+   /* x_lut = acc * mul >> shift with a 15-bit multiplier. */
+   float r = s_acc / host->lut_scale;
+   unsigned e = 0;
+   while (r * (float)(1u << e) < 16384.0f && e < 30)
+      e++;
+   host->lut_mul = MIN2((unsigned)lrintf(r * (float)(1u << e)), 32767);
+   host->lut_shift = e;
+
+   /* The LO table's first entries misbehave (RE-LOG Test 75: for x in
+    * [LO_START, LO_START + ~160) the unit returns LO[512] * (x + 8) / 256
+    * instead of the entries), so the LO domain starts at -512, inside
+    * the LE range, and LUT_CFG gives LE priority in the overlap. */
+   for (unsigned i = 0; i < 513; i++) {
+      float xle = (-16384.0f + 32.0f * i) * host->lut_scale;
+      float xlo = (RKT_LUT_LO_START + 32.0f * i) * host->lut_scale;
+      host->lut_le[i] = CLAMP(lrintf(2.0f * silu_f(xle) / host->lut_scale),
+                              -32768, 32767);
+      host->lut_lo[i] = CLAMP(lrintf(2.0f * silu_f(xlo) / host->lut_scale),
+                              -32768, 32767);
+   }
+
+   /* The job's LUT payload in the hardware framing: a leading word, the
+    * 513 entries, entry 1 again (vendor loader streams, Test 73). */
+   if (!subgraph->has_lut) {
+      const int16_t *tabs[2] = {host->lut_le, host->lut_lo};
+      for (unsigned t = 0; t < 2; t++) {
+         uint16_t *w = &subgraph->lut_words[t * 515];
+         w[0] = 0;
+         for (unsigned i = 0; i < 513; i++)
+            w[1 + i] = (uint16_t)tabs[t][i];
+         w[514] = (uint16_t)tabs[t][1];
+      }
+      subgraph->has_lut = true;
+   }
 }
 
 /* RKT_NO_CHAIN reverts to one job per operation -- except when the graph
@@ -1010,6 +1088,20 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          host->addition_scale = other->scale;
          host->addition_relu = poperations[i].add.relu;
 
+         break;
+      }
+      case PIPE_ML_OPERATION_TYPE_LOGISTIC:
+         /* Half of a SiLU pattern (rkt_ml_operation_supported): folded
+          * into the convolution when its MUL comes by. */
+         break;
+      case PIPE_ML_OPERATION_TYPE_MUL: {
+         /* MUL(conv_out, sigmoid(conv_out)): the convolution runs the
+          * DPU LUT path and writes the MUL's output directly. */
+         struct rkt_operation *host = NULL;
+         for (unsigned k = 0; k < 2 && host == NULL; k++)
+            host = find_producer(subgraph, poperations[i].input_tensors[k]->index);
+         assert(host && !host->silu && host->add_tensor == -1 && !host->relu);
+         lower_silu(subgraph, host, poperations[i].output_tensors[0]);
          break;
       }
       default:
@@ -1366,6 +1458,10 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       job.task_count = total_tasks;
       job.task_desc_addr = rkt_resource(descs_rsc)->phys_addr;
       job.last_int_mask = last_int_mask;
+      if (subgraph->has_lut) {
+         job.lut_data = (uint64_t)(uintptr_t)subgraph->lut_words;
+         job.lut_count = 1030;
+      }
       util_dynarray_append(&jobs, job);
    } else
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,

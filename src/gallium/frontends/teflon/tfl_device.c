@@ -19,6 +19,113 @@
 
 static bool fused_relu6_supported(TfLiteTensor *tensor);
 
+/* Producer node of a tensor in the execution plan, or -1. */
+static int
+tensor_producer(TfLiteContext *ctx, TfLiteIntArray *plan, int tensor,
+                TfLiteNode **node, TfLiteRegistration **reg)
+{
+   for (int i = 0; i < plan->size; i++) {
+      TfLiteNode *n;
+      TfLiteRegistration *r;
+      ctx->GetNodeAndRegistration(ctx, plan->data[i], &n, &r);
+      for (int j = 0; j < n->outputs->size; j++)
+         if (n->outputs->data[j] == tensor) {
+            *node = n;
+            *reg = r;
+            return plan->data[i];
+         }
+   }
+   return -1;
+}
+
+static unsigned
+tensor_consumers(TfLiteContext *ctx, TfLiteIntArray *plan, int tensor)
+{
+   unsigned count = 0;
+   for (int i = 0; i < plan->size; i++) {
+      TfLiteNode *n;
+      TfLiteRegistration *r;
+      ctx->GetNodeAndRegistration(ctx, plan->data[i], &n, &r);
+      for (int j = 0; j < n->inputs->size; j++)
+         if (n->inputs->data[j] == tensor)
+            count++;
+   }
+   return count;
+}
+
+/* CONV -> LOGISTIC -> MUL(conv_out, logistic_out) is x * sigmoid(x)
+ * (SiLU), the activation of the yolo family.  Given the LOGISTIC node
+ * (or the MUL node, with mul_node set), check that the pattern holds
+ * and that the intermediate tensors have no other readers, so a driver
+ * may fuse the activation into the convolution. */
+static bool
+silu_pattern(TfLiteContext *ctx, TfLiteIntArray *plan, TfLiteNode *node,
+             TfLiteRegistration *reg)
+{
+   TfLiteNode *conv, *logi, *n;
+   TfLiteRegistration *conv_reg, *r;
+   int conv_out, logi_out;
+
+   /* Building a partition: the nodes are here because the pattern held. */
+   if (plan == NULL)
+      return true;
+
+   if (reg->builtin_code == kTfLiteBuiltinLogistic) {
+      if (node->inputs->size != 1)
+         return false;
+      conv_out = node->inputs->data[0];
+      logi_out = node->outputs->data[0];
+      logi = node;
+   } else if (reg->builtin_code == kTfLiteBuiltinMul) {
+      if (node->inputs->size != 2)
+         return false;
+      /* One input is the LOGISTIC of the other. */
+      logi = NULL;
+      for (int k = 0; k < 2 && logi == NULL; k++) {
+         int t = node->inputs->data[k];
+         if (tensor_producer(ctx, plan, t, &n, &r) < 0)
+            continue;
+         if (r->builtin_code == kTfLiteBuiltinLogistic &&
+             n->inputs->data[0] == node->inputs->data[1 - k]) {
+            logi = n;
+            logi_out = t;
+            conv_out = node->inputs->data[1 - k];
+         }
+      }
+      if (logi == NULL)
+         return false;
+   } else {
+      return false;
+   }
+
+   if (tensor_producer(ctx, plan, conv_out, &conv, &conv_reg) < 0)
+      return false;
+   if (conv_reg->builtin_code != kTfLiteBuiltinConv2d &&
+       conv_reg->builtin_code != kTfLiteBuiltinDepthwiseConv2d)
+      return false;
+   if (conv_reg->builtin_code == kTfLiteBuiltinConv2d &&
+       ((TfLiteConvParams *)conv->builtin_data)->activation != kTfLiteActNone)
+      return false;
+   if (conv_reg->builtin_code == kTfLiteBuiltinDepthwiseConv2d &&
+       ((TfLiteDepthwiseConvParams *)conv->builtin_data)->activation !=
+          kTfLiteActNone)
+      return false;
+
+   /* The MUL that consumes both. */
+   if (tensor_consumers(ctx, plan, logi_out) != 1 ||
+       tensor_consumers(ctx, plan, conv_out) != 2)
+      return false;
+   for (int i = 0; i < plan->size; i++) {
+      ctx->GetNodeAndRegistration(ctx, plan->data[i], &n, &r);
+      if (r->builtin_code != kTfLiteBuiltinMul || n->inputs->size != 2)
+         continue;
+      int a = n->inputs->data[0], b = n->inputs->data[1];
+      if ((a == conv_out && b == logi_out) || (a == logi_out && b == conv_out))
+         return true;
+   }
+   return false;
+}
+
 enum teflon_debug_flags {
    TEFLON_DEBUG_VERBOSE = 1 << 1,
 };
@@ -47,6 +154,9 @@ struct teflon_delegate {
    struct pipe_ml_device *ml_dev;
    struct pipe_tensor *tensors;
    unsigned tensor_count;
+   /* Execution plan during PrepareDelegate (pattern checks); NULL once
+    * the partitions are being built. */
+   TfLiteIntArray *plan;
 };
 
 struct teflon_subgraph {
@@ -190,6 +300,8 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
       break;
    case kTfLiteBuiltinMul:
       operation->type = PIPE_ML_OPERATION_TYPE_MUL;
+      operation->silu_pattern =
+         silu_pattern(tf_context, delegate->plan, node, node_registration);
       break;
    case kTfLiteBuiltinAdd: {
       TfLiteAddParams *params = (TfLiteAddParams *)node->builtin_data;
@@ -276,6 +388,8 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
       break;
    case kTfLiteBuiltinLogistic:
       operation->type = PIPE_ML_OPERATION_TYPE_LOGISTIC;
+      operation->silu_pattern =
+         silu_pattern(tf_context, delegate->plan, node, node_registration);
       break;
    case kTfLiteBuiltinTanh:
       operation->type = PIPE_ML_OPERATION_TYPE_TANH;
@@ -609,6 +723,7 @@ partition_init(TfLiteContext *tf_context, const char *buffer, size_t length)
    long start = 0, end = 0;
 
    memset(operations, 0, sizeof(operations));
+   delegate->plan = NULL;
 
    if (unlikely(debug_get_option_debug_teflon() & TEFLON_DEBUG_VERBOSE)) {
       struct timespec time;
@@ -902,6 +1017,7 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
    TfLiteIntArray *plan;
    TfLiteNode *node;
    TF_LITE_ENSURE_STATUS(tf_context->GetExecutionPlan(tf_context, &plan));
+   delegate->plan = plan;
 
    delegate->tensors = calloc(tf_context->tensors_size, sizeof(*delegate->tensors));
 

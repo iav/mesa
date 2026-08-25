@@ -1090,6 +1090,15 @@ struct pipe_ml_operation
    enum pipe_ml_operation_type type;
 
    /**
+    * For LOGISTIC and MUL: the operation is one half of the
+    * CONV -> LOGISTIC -> MUL(conv_out, logistic_out) pattern, i.e. a
+    * x * sigmoid(x) (SiLU/Swish) activation applied to a convolution
+    * output that has no other consumer.  A driver that fuses the
+    * activation into the convolution can accept the pair on that basis.
+    */
+   bool silu_pattern;
+
+   /**
     * Tensor used as input.
     */
    struct pipe_tensor **input_tensors;
