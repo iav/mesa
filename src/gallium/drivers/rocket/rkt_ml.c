@@ -918,46 +918,58 @@ lower_silu(struct rkt_ml_subgraph *subgraph, struct rkt_operation *host,
    host->output_index = out->index;
    host->output_zero_point = out->zero_point;
    host->output_scale = out->scale;
+}
 
-   float s_acc = host->input_scale * host->weights_scale;
-   host->lut_scale = RKT_LUT_SCALE;
+/* The LUT domain of the job, chosen once every SiLU host has its final
+ * output quantization (concat / quantize retargets change it): the LUT
+ * output is 16 bits and holds 2 * silu(x) in LUT units, so the unit must
+ * scale with the largest value any SiLU layer of the job can produce
+ * (x_max = (255 - zp) * s_out over the hosts; a layer quantized at 0.68
+ * per LSB wants x up to 172, a fixed [-8, 8) domain saturated there).
+ * x_max / 8192 keeps x_lut within 16 bits up to 4 * x_max and leaves a
+ * table entry (32 units) at x_max / 256.  Then per host: BN multiplier
+ * x_lut = acc * mul >> shift, and the shared tables in the hardware
+ * framing (entry i at word i, the two trailing words repeat the last
+ * entry). */
+static void
+finalize_silu(struct rkt_ml_subgraph *subgraph)
+{
+   float x_max = 0.0f;
+   util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
+      if (op->silu)
+         x_max = MAX2(x_max, (255 - (int)op->output_zero_point) * op->output_scale);
+   if (x_max == 0.0f)
+      return;
+   float lut_scale = MAX2(x_max, 1.0f) / 8192.0f;
 
-   /* x_lut = acc * mul >> shift with a 15-bit multiplier. */
-   float r = s_acc / host->lut_scale;
-   unsigned e = 0;
-   while (r * (float)(1u << e) < 16384.0f && e < 30)
-      e++;
-   host->lut_mul = MIN2((unsigned)lrintf(r * (float)(1u << e)), 32767);
-   host->lut_shift = e;
+   util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op) {
+      if (!op->silu)
+         continue;
+      float s_acc = op->input_scale * op->weights_scale;
+      float r = s_acc / lut_scale;
+      unsigned e = 0;
+      while (r * (float)(1u << e) < 16384.0f && e < 30)
+         e++;
+      op->lut_scale = lut_scale;
+      op->lut_mul = MIN2((unsigned)lrintf(r * (float)(1u << e)), 32767);
+      op->lut_shift = e;
+   }
 
    /* The LO table's first entries misbehave (RE-LOG Test 75: for x in
     * [LO_START, LO_START + ~160) the unit returns LO[512] * (x + 8) / 256
     * instead of the entries), so the LO domain starts at -512, inside
     * the LE range, and LUT_CFG gives LE priority in the overlap. */
-   for (unsigned i = 0; i < 513; i++) {
-      float xle = (-16384.0f + 32.0f * i) * host->lut_scale;
-      float xlo = (RKT_LUT_LO_START + 32.0f * i) * host->lut_scale;
-      host->lut_le[i] = CLAMP(lrintf(2.0f * silu_f(xle) / host->lut_scale),
-                              -32768, 32767);
-      host->lut_lo[i] = CLAMP(lrintf(2.0f * silu_f(xlo) / host->lut_scale),
-                              -32768, 32767);
-   }
-
-   /* The job's LUT payload: entry i at word i (the unit indexes the
-    * table by (x - START) >> 5 straight into the word array; the
-    * vendor's leading zero word puts every entry one bin late, which
-    * costs it ~1.3 LSB on the steep positive branch), the two trailing
-    * words repeat the last entry. */
-   if (!subgraph->has_lut) {
-      const int16_t *tabs[2] = {host->lut_le, host->lut_lo};
-      for (unsigned t = 0; t < 2; t++) {
-         uint16_t *w = &subgraph->lut_words[t * 515];
-         for (unsigned i = 0; i < 513; i++)
-            w[i] = (uint16_t)tabs[t][i];
-         w[513] = w[514] = (uint16_t)tabs[t][512];
+   for (unsigned t = 0; t < 2; t++) {
+      uint16_t *w = &subgraph->lut_words[t * 515];
+      for (unsigned i = 0; i < 513; i++) {
+         float x = (t == 0 ? -16384.0f + 32.0f * i
+                           : RKT_LUT_LO_START + 32.0f * i) * lut_scale;
+         int v = CLAMP(lrintf(2.0f * silu_f(x) / lut_scale), -32768, 32767);
+         w[i] = (uint16_t)(int16_t)v;
       }
-      subgraph->has_lut = true;
+      w[513] = w[514] = w[512];
    }
+   subgraph->has_lut = true;
 }
 
 /* RKT_NO_CHAIN reverts to one job per operation -- except when the graph
@@ -1359,6 +1371,20 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          DBG("poperation->type %d\n", poperations[i].type);
          UNREACHABLE("Unsupported ML operation type");
       }
+   }
+
+   finalize_silu(subgraph);
+
+   if (getenv("RKT_OPS")) {
+      unsigned n = 0;
+      util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
+         fprintf(stderr, "rkt op %u: in %u+%u (C%u of %u, s %.4g zp %u) -> out %u+%u (C%u %ux%u s %.4g zp %u) k%u s%u%s%s%s add %d+%u\n",
+                 n++, op->input_index, op->src_offset, op->input_channels, op->src_channels,
+                 op->input_scale, op->input_zero_point, op->output_index, op->dst_offset,
+                 op->output_channels, op->output_width, op->output_height, op->output_scale,
+                 op->output_zero_point, op->weights_width, op->stride,
+                 op->silu ? " silu" : "", op->is_pool ? " pool" : "", op->is_upsample ? " up" : "",
+                 op->add_tensor, op->add_src_offset);
    }
 
    /* Create input tensors */
