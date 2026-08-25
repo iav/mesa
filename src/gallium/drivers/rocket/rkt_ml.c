@@ -33,6 +33,9 @@ prof_on(void)
 
 #include "rkt_coefs.h"
 #include "rkt_ml.h"
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 #include "rkt_regcmd.h"
 #include "rkt_task.h"
 
@@ -245,6 +248,13 @@ resolve_views(struct rkt_ml_subgraph *subgraph, struct rkt_operation *op)
    struct rkt_view *v;
 
    while ((v = find_view(subgraph, op->input_index)) != NULL) {
+      assert(!v->nchw);
+      if (v->input_float || v->input_nchw) {
+         op->input_float |= v->input_float;
+         op->input_nchw |= v->input_nchw;
+         op->input_index = v->src_index;
+         continue;
+      }
       if (v->is_pad) {
          op->input_width = v->src_width;
          op->input_height = v->src_height;
@@ -633,8 +643,17 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       if (operation->input_tensors[k]->data == NULL &&
           operation->input_tensors[k]->dims_count != 4)
          return false;
+   if (operation->input_pack) {
+      /* Graph-input quantize/transpose folded into the input packing. */
+      supported = operation->type == PIPE_ML_OPERATION_TYPE_QUANTIZE
+                     ? operation->output_tensors[0]->type_size == 1 &&
+                          tensor_quantization_supported(operation->output_tensors[0])
+                     : operation->input_tensors[0]->type_size == 1;
+      return supported;
+   }
    for (unsigned k = 0; k < operation->output_count; k++)
-      if (operation->output_tensors[k]->dims_count != 4)
+      if (operation->output_tensors[k]->dims_count != 4 &&
+          !operation->nchw_export)
          return false;
    /* The CNA/CORE width and height fields are 11 bits (DATAIN_WIDTH,
     * DATAOUT_WIDTH ...): yolo's DFL convolution over a 4x2100 map came
@@ -740,6 +759,14 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                   in->scale == out->scale && in->zero_point == out->zero_point;
       break;
    }
+   case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
+   case PIPE_ML_OPERATION_TYPE_RESHAPE:
+      /* Only the NHWC -> planar CHW export pair (teflon establishes it);
+       * the readback writes that layout directly. */
+      supported = operation->nchw_export &&
+                  operation->input_tensors[0]->type_size == 1 &&
+                  tensor_quantization_supported(operation->input_tensors[0]);
+      break;
    case PIPE_ML_OPERATION_TYPE_RESIZE: {
       /* Nearest-neighbour 2x (yolo's neck upsamples): DPU unpooling. */
       const struct pipe_tensor *in = operation->input_tensors[0];
@@ -1294,6 +1321,40 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          util_dynarray_append(&subgraph->operations, operation);
          break;
       }
+      case PIPE_ML_OPERATION_TYPE_QUANTIZE:
+      case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
+      case PIPE_ML_OPERATION_TYPE_RESHAPE:
+         if (poperations[i].input_pack) {
+            const struct pipe_ml_operation *pi = &poperations[i];
+            struct rkt_view v = {
+               .index = pi->output_tensors[0]->index,
+               .src_index = pi->input_tensors[0]->index,
+               .input_float = pi->type == PIPE_ML_OPERATION_TYPE_QUANTIZE,
+               .input_nchw = pi->type == PIPE_ML_OPERATION_TYPE_TRANSPOSE,
+            };
+            util_dynarray_append(&subgraph->views, v);
+            break;
+         }
+         if (poperations[i].type == PIPE_ML_OPERATION_TYPE_QUANTIZE)
+            goto quantize;
+      /* fallthrough */
+      {
+         /* NCHW export pair: the RESHAPE is a pass-through view, the
+          * TRANSPOSE marks the layout. */
+         const struct pipe_ml_operation *pt = &poperations[i];
+         bool tr = pt->type == PIPE_ML_OPERATION_TYPE_TRANSPOSE;
+         /* Only the TRANSPOSE sees the NHWC tensor: its dims[3] is the
+          * channel count; the RESHAPE's input is already CHW. */
+         struct rkt_view v = {
+            .index = pt->output_tensors[0]->index,
+            .src_index = pt->input_tensors[0]->index,
+            .nchw = tr,
+            .channels = tr ? pt->input_tensors[0]->dims[3] : 0,
+            .src_channels = tr ? pt->input_tensors[0]->dims[3] : 0,
+         };
+         util_dynarray_append(&subgraph->views, v);
+         break;
+      }
       case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE: {
          const struct pipe_ml_operation *ps = &poperations[i];
          struct rkt_view v = {
@@ -1323,7 +1384,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          util_dynarray_append(&subgraph->views, v);
          break;
       }
-      case PIPE_ML_OPERATION_TYPE_QUANTIZE: {
+      quantize: {
          const struct pipe_ml_operation *pq = &poperations[i];
          const struct pipe_tensor *in = pq->input_tensors[0];
          const struct pipe_tensor *out = pq->output_tensors[0];
@@ -1506,6 +1567,10 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    DBG("Processing input\n");
    double t0 = prof_ms();
 
+   /* Nothing but views (see subgraph_create): nothing to run. */
+   if (!util_dynarray_num_elements(&subgraph->operations, struct rkt_operation))
+      return;
+
    for (int i = 0; i < inputs_count; i++) {
       struct rkt_operation *operation =
          find_first_consumer(subgraph, input_idxs[i]);
@@ -1525,6 +1590,12 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             }
          }
       }
+
+      /* A partition of nothing but views (a delegation window cut
+       * between a graph-input QUANTIZE/TRANSPOSE and its convolution)
+       * has no consumer to pack for. */
+      if (operation == NULL)
+         continue;
 
       struct pipe_resource *input =
          &rkt_get_tensor(subgraph, input_idxs[i])->base;
@@ -1556,6 +1627,54 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          struct pipe_transfer *transfer_out;
          /* NHWC user memory: [height (dims[1])][width (dims[2])][C]. */
          uint8_t(*input_in)[input_width][input_channels] = inputs[i];
+         /* A float NCHW graph input (yolo exports): quantize and
+          * transpose on the way in instead of two CPU ops. */
+         uint8_t *fbuf = NULL;
+         if (operation->input_float || operation->input_nchw) {
+            unsigned px = input_width * input_height;
+            fbuf = malloc(px * input_channels);
+            const float *ff = inputs[i];
+            const uint8_t *bb = inputs[i];
+            float inv = 1.0f / operation->input_scale;
+            unsigned p0 = 0;
+#ifdef __aarch64__
+            if (operation->input_float && operation->input_nchw &&
+                input_channels == 3) {
+               /* 16 pixels per step: three planes -> interleaved RGB. */
+               const float32x4_t vinv = vdupq_n_f32(inv);
+               const float32x4_t vzp = vdupq_n_f32((float)operation->input_zero_point);
+               for (; p0 + 16 <= px; p0 += 16) {
+                  uint8x16x3_t rgb;
+                  for (unsigned c = 0; c < 3; c++) {
+                     const float *fp = ff + c * px + p0;
+                     uint16x8_t lo, hi;
+                     #define Q4(k) vqmovun_s32(vcvtnq_s32_f32( \
+                        vmlaq_f32(vzp, vld1q_f32(fp + 4 * (k)), vinv)))
+                     lo = vcombine_u16(Q4(0), Q4(1));
+                     hi = vcombine_u16(Q4(2), Q4(3));
+                     #undef Q4
+                     rgb.val[c] = vcombine_u8(vqmovn_u16(lo), vqmovn_u16(hi));
+                  }
+                  vst3q_u8(fbuf + p0 * 3, rgb);
+               }
+            }
+#endif
+            for (unsigned c = 0; c < input_channels; c++) {
+               for (unsigned p = p0; p < px; p++) {
+                  unsigned si = operation->input_nchw ? c * px + p : p * input_channels + c;
+                  uint8_t q;
+                  if (operation->input_float) {
+                     float r = ff[si] * inv + (float)operation->input_zero_point;
+                     q = (uint8_t)CLAMP(lrintf(r), 0, 255);
+                  } else {
+                     q = bb[si] ^ fold;
+                  }
+                  fbuf[p * input_channels + c] = q;
+               }
+            }
+            input_in = (void *)fbuf;
+            fold = 0;
+         }
          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
                                         PIPE_MAP_WRITE, &transfer_out);
 
@@ -1632,6 +1751,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             }
          }
 
+         free(fbuf);
          if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
             rkt_dump_buffer(map, "input", 0, input_idxs[i], 0,
                             pipe_buffer_size(&input_tensor->base));
@@ -1906,6 +2026,9 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
 {
    struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
 
+   if (!util_dynarray_num_elements(&subgraph->operations, struct rkt_operation))
+      return;
+
    DBG("Processing output\n");
    double tw = 0, tu = 0, tstart = prof_ms();
 
@@ -1913,13 +2036,16 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
       unsigned idx = output_idxs[i];
       unsigned ch_off = 0, view_channels = 0;
       struct rkt_view *v;
+      bool nchw = false;
 
       /* A partition output that is a channel slice of a tensor: read
-       * the source at the surface offset. */
+       * the source at the surface offset; an NCHW export: write the
+       * planar layout. */
       while ((v = find_view(subgraph, idx)) != NULL) {
          assert(!v->is_pad);
          ch_off += v->ch_off;
-         if (!view_channels)
+         nchw |= v->nchw;
+         if (!view_channels && v->channels)
             view_channels = v->channels;
          idx = v->src_index;
       }
@@ -2002,6 +2128,23 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
             unsigned c0 = g * 8;
             unsigned nc = MIN2(8u, out_c - c0);
             const uint64_t *src64 = (const uint64_t *)(raw + g * surf);
+            if (nchw) {
+               /* Planar: channel c of surface g is a contiguous plane. */
+               for (unsigned p = 0; p < px; p++) {
+                  uint64_t v = src64[p];
+                  for (unsigned c = 0; c < nc; c++) {
+                     uint8_t q = (uint8_t)(v >> (8 * c)) + 0x80;
+                     if (requant) {
+                        float r = (float)operation->orig_output_zero_point +
+                                  ((int)q - (int)operation->output_zero_point) *
+                                     rq_scale;
+                        q = (uint8_t)CLAMP(lrintf(r), 0, 255);
+                     }
+                     ubuf[(c0 + c) * px + p] = q ^ fold;
+                  }
+               }
+               continue;
+            }
             uint8_t *dst = ubuf + c0;
             for (unsigned p = 0; p < px; p++, dst += out_c) {
                uint64_t v = src64[p];

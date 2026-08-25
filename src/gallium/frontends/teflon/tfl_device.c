@@ -53,6 +53,101 @@ tensor_consumers(TfLiteContext *ctx, TfLiteIntArray *plan, int tensor)
    return count;
 }
 
+/* TRANSPOSE(0,3,1,2) -> RESHAPE(rank < 4): an NHWC tensor exported as
+ * planar CHW (yolo detection heads).  True for the TRANSPOSE when its
+ * only reader is such a RESHAPE, and for the RESHAPE when its input is
+ * such a TRANSPOSE. */
+static bool
+nchw_export_pattern(TfLiteContext *ctx, TfLiteIntArray *plan, TfLiteNode *node,
+                    TfLiteRegistration *reg)
+{
+   TfLiteNode *n;
+   TfLiteRegistration *r;
+
+   if (plan == NULL)
+      return true;
+   if (reg->builtin_code == kTfLiteBuiltinTranspose) {
+      int *perm = ctx->tensors[node->inputs->data[1]].data.data;
+      TfLiteTensor *in = &ctx->tensors[node->inputs->data[0]];
+      if (in->dims->size != 4 || perm[0] != 0 || perm[1] != 3 ||
+          perm[2] != 1 || perm[3] != 2)
+         return false;
+      int out = node->outputs->data[0];
+      if (tensor_consumers(ctx, plan, out) != 1)
+         return false;
+      for (int i = 0; i < plan->size; i++) {
+         ctx->GetNodeAndRegistration(ctx, plan->data[i], &n, &r);
+         for (int j = 0; j < n->inputs->size; j++)
+            if (n->inputs->data[j] == out)
+               return r->builtin_code == kTfLiteBuiltinReshape &&
+                      ctx->tensors[n->outputs->data[0]].dims->size < 4;
+      }
+      return false;
+   }
+   if (reg->builtin_code == kTfLiteBuiltinReshape) {
+      if (ctx->tensors[node->outputs->data[0]].dims->size >= 4)
+         return false;
+      if (tensor_producer(ctx, plan, node->inputs->data[0], &n, &r) < 0)
+         return false;
+      return r->builtin_code == kTfLiteBuiltinTranspose &&
+             nchw_export_pattern(ctx, plan, n, r);
+   }
+   return false;
+}
+
+/* QUANTIZE(float -> int8) -> TRANSPOSE(0,2,3,1) at the graph input
+ * (yolo exports take a float NCHW image): true for the QUANTIZE whose
+ * only reader is such a TRANSPOSE, and for that TRANSPOSE. */
+static bool
+input_pack_pattern(TfLiteContext *ctx, TfLiteIntArray *plan, TfLiteNode *node,
+                   TfLiteRegistration *reg)
+{
+   TfLiteNode *n;
+   TfLiteRegistration *r;
+
+   if (getenv("TEFLON_NO_INPACK"))
+      return false;
+   if (reg->builtin_code == kTfLiteBuiltinQuantize) {
+      TfLiteTensor *in = &ctx->tensors[node->inputs->data[0]];
+      TfLiteTensor *out = &ctx->tensors[node->outputs->data[0]];
+      if (in->type != kTfLiteFloat32 || out->type != kTfLiteInt8 ||
+          in->dims->size != 4)
+         return false;
+      /* partition_init has no plan: only accepted nodes get here, and
+       * a float -> int8 QUANTIZE is accepted only through this pattern. */
+      if (plan == NULL)
+         return true;
+      if (tensor_producer(ctx, plan, node->inputs->data[0], &n, &r) >= 0)
+         return false;
+      int o = node->outputs->data[0];
+      if (tensor_consumers(ctx, plan, o) != 1)
+         return false;
+      for (int i = 0; i < plan->size; i++) {
+         ctx->GetNodeAndRegistration(ctx, plan->data[i], &n, &r);
+         for (int j = 0; j < n->inputs->size; j++)
+            if (n->inputs->data[j] == o) {
+               if (r->builtin_code != kTfLiteBuiltinTranspose)
+                  return false;
+               int *perm = ctx->tensors[n->inputs->data[1]].data.data;
+               return perm[0] == 0 && perm[1] == 2 && perm[2] == 3 && perm[3] == 1;
+            }
+      }
+      return false;
+   }
+   if (reg->builtin_code == kTfLiteBuiltinTranspose) {
+      int *perm = ctx->tensors[node->inputs->data[1]].data.data;
+      if (!(perm[0] == 0 && perm[1] == 2 && perm[2] == 3 && perm[3] == 1))
+         return false;
+      if (plan == NULL)
+         return true;
+      if (tensor_producer(ctx, plan, node->inputs->data[0], &n, &r) < 0)
+         return false;
+      return r->builtin_code == kTfLiteBuiltinQuantize &&
+             input_pack_pattern(ctx, plan, n, r);
+   }
+   return false;
+}
+
 /* CONV -> LOGISTIC -> MUL(conv_out, logistic_out) is x * sigmoid(x)
  * (SiLU), the activation of the yolo family.  Given the LOGISTIC node
  * (or the MUL node, with mul_node set), check that the pattern holds
@@ -375,6 +470,8 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
 
       operation->type = PIPE_ML_OPERATION_TYPE_RESHAPE;
       memcpy(operation->reshape.shape, shape, 4 * sizeof(*operation->reshape.shape));
+      operation->nchw_export =
+         nchw_export_pattern(tf_context, delegate->plan, node, node_registration);
       break;
    }
    case kTfLiteBuiltinLeakyRelu: {
@@ -409,6 +506,10 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
 
       operation->type = PIPE_ML_OPERATION_TYPE_TRANSPOSE;
       memcpy(operation->transpose.perm, perm, 4 * sizeof(*operation->transpose.perm));
+      operation->nchw_export =
+         nchw_export_pattern(tf_context, delegate->plan, node, node_registration);
+      operation->input_pack =
+         input_pack_pattern(tf_context, delegate->plan, node, node_registration);
       break;
    }
    case kTfLiteBuiltinSlice: {
@@ -463,6 +564,8 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
    }
    case kTfLiteBuiltinQuantize: {
       operation->type = PIPE_ML_OPERATION_TYPE_QUANTIZE;
+      operation->input_pack =
+         input_pack_pattern(tf_context, delegate->plan, node, node_registration);
       break;
    }
    default:

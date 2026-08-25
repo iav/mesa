@@ -172,6 +172,10 @@ struct rkt_operation {
     * src_channels channels, of which input_channels are consumed. */
    unsigned src_offset;
    unsigned src_channels;
+   /* The input is read straight from the user's float NCHW buffer and
+    * quantized with input_scale / input_zero_point while packing. */
+   bool input_float;
+   bool input_nchw;
    /* A QUANTIZE folded into this producer: the tensor it used to write
     * and that tensor's quantization, so a partition output that still
     * wants the old tensor can be requantized on the CPU. */
@@ -213,6 +217,13 @@ struct rkt_view {
    unsigned index;
    unsigned src_index;
    bool is_pad;
+   /* An NHWC tensor exported as planar CHW (TRANSPOSE 0,3,1,2 +
+    * RESHAPE): resolved only by read_outputs. */
+   bool nchw;
+   /* Graph input arriving as float NCHW: the consumer packs from it
+    * (QUANTIZE float->int8 and TRANSPOSE 0,2,3,1 folded in). */
+   bool input_float;
+   bool input_nchw;
    /* slice */
    unsigned ch_off;
    unsigned channels;

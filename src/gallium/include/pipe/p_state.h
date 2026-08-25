@@ -1104,6 +1104,21 @@ struct pipe_ml_operation
    bool silu_pattern;
 
    /**
+    * For TRANSPOSE and RESHAPE: TRANSPOSE(0,3,1,2) whose only reader is
+    * a RESHAPE to a lower rank (or the RESHAPE itself), i.e. an NHWC
+    * result leaving the graph as planar CHW.  A driver can produce that
+    * layout when it reads its outputs back instead of running the ops.
+    */
+   bool nchw_export;
+
+   /**
+    * For QUANTIZE (float -> int8) and TRANSPOSE(0,2,3,1) on a graph
+    * input: the model takes a float NCHW image; a driver that packs its
+    * input itself can quantize and transpose on the way in.
+    */
+   bool input_pack;
+
+   /**
     * Tensor used as input.
     */
    struct pipe_tensor **input_tensors;
