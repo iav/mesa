@@ -536,6 +536,41 @@ lower_identity_copy(struct rkt_ml_subgraph *subgraph,
    free(bdata);
 }
 
+/* The vendor's concat-leg copy: a DPU-only task per 8-channel surface,
+ * RDMA in, WDMA out, no MAC (probe-C2F.rknn tasks 1/2/4/5/6).  Same
+ * quantization only for now. */
+static void
+lower_dpu_copy(struct rkt_ml_subgraph *subgraph, const struct pipe_tensor *in,
+               const struct pipe_tensor *out, unsigned dst_offset,
+               struct rkt_operation *op)
+{
+   op->is_upsample = true;
+   op->is_dpu_copy = true;
+   op->add_tensor = -1;
+   op->tasks = UTIL_DYNARRAY_INIT;
+   op->input_index = in->index;
+   op->input_width = in->dims[2];
+   op->input_height = in->dims[1];
+   op->input_channels = in->dims[3];
+   op->input_zero_point = in->zero_point;
+   op->input_scale = in->scale;
+   op->src_channels = op->input_channels;
+   op->output_index = out->index;
+   op->output_width = in->dims[2];
+   op->output_height = in->dims[1];
+   op->output_channels = in->dims[3];
+   op->output_zero_point = out->zero_point;
+   op->output_scale = out->scale;
+   op->dst_offset = dst_offset;
+   resolve_views(subgraph, op);
+   for (unsigned s = 0; s < DIV_ROUND_UP(op->input_channels, 8); s++) {
+      struct split_task task = {0};
+      task.num = s;
+      task.channel_group = s;
+      util_dynarray_append(&op->tasks, task);
+   }
+}
+
 /* Whether the concatenation at poperations[conc_idx] is the only reader
  * of the tensor: only then may its producer be retargeted to write the
  * concat output slice directly (the tensor itself then never
@@ -1157,8 +1192,11 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             } else {
                struct rkt_operation copy = {0};
                copy.add_tensor = -1;
-               lower_identity_copy(subgraph, in, out, dst_offset, false,
-                                   &copy);
+               if (!requant && getenv("RKT_DPU_COPY"))
+                  lower_dpu_copy(subgraph, in, out, dst_offset, &copy);
+               else
+                  lower_identity_copy(subgraph, in, out, dst_offset, false,
+                                      &copy);
                util_dynarray_append(&subgraph->operations, copy);
             }
             ch_off += in->dims[3];

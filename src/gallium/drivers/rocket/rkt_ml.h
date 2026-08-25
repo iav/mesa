@@ -127,6 +127,9 @@ struct rkt_operation {
    /* Nearest-neighbour 2x upsample: one DPU-only task per 8-channel
     * surface, DPU_RDMA "unpooling" mode (vendor Resize, RE-LOG Test 77). */
    bool is_upsample;
+   /* A DPU-only RDMA->WDMA copy (the vendor's concat-leg copy): the
+    * upsample task skeleton without the unpooling. */
+   bool is_dpu_copy;
    /* Average pooling instead of max: OPERATION_MODE method bits 0 and the
     * RECIP_KERNEL registers = 65536/kernel (vendor probe-AP: 7 -> 9362). */
    bool pool_avg;
