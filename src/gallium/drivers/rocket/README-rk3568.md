@@ -6,9 +6,9 @@ from is MR !42134; everything RK3568-specific was derived by comparing
 our command streams byte-for-byte against captured vendor (librknnrt)
 streams.  This file records what is *not* obvious from the code: the
 data flow, the memory conventions, and the list of things that look
-arbitrary but are load-bearing.  "Test N" refers to the author's lab
-log (RE-LOG.md, in Russian, kept with https://github.com/iav/rk3568-npu);
-the register names follow `registers.xml`.
+arbitrary but are load-bearing.  "Test N" refers to the lab log
+(RE-LOG.md in https://github.com/iav/rk3568-npu — chronological, with the
+dead ends left in); the register names follow `registers.xml`.
 
 ## 1. Data flow
 
