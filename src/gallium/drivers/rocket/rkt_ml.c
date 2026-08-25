@@ -9,7 +9,25 @@
 #include "util/u_inlines.h"
 
 #include <math.h>
+#include <time.h>
 #include <xf86drm.h>
+
+/* RKT_PROF=1: per-invoke phase timing (pack / submit / wait / unpack). */
+static double
+prof_ms(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
+static bool
+prof_on(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("RKT_PROF") != NULL;
+   return on;
+}
 
 #include "drm-uapi/rocket_accel.h"
 
@@ -1460,6 +1478,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    int ret;
 
    DBG("Processing input\n");
+   double t0 = prof_ms();
 
    for (int i = 0; i < inputs_count; i++) {
       struct rkt_operation *operation =
@@ -1526,13 +1545,27 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             /* ARGB input: packed RGB, raw uint8 (the CNA CVT stage shifts by
              * -128), rows aligned to 8 bytes with zero padding. */
             unsigned line = DIV_ROUND_UP(input_width * 3, 8) * 8;
+            unsigned row = input_width * 3;
             for (int y = 0; y < input_height; y++) {
-               unsigned n = y * line;
-               for (int x = 0; x < input_width; x++)
-                  for (int c = 0; c < 3; c++)
-                     map[n++] = input_in[y][x][c] ^ fold;
-               for (; n < (y + 1) * line;)
-                  map[n++] = 0;
+               const uint8_t *src = (const uint8_t *)input_in[y];
+               uint8_t *dst = map + y * line;
+               if (fold == 0) {
+                  memcpy(dst, src, row);
+               } else {
+                  /* 8 bytes at a time into the uncached mapping. */
+                  uint64_t f64 = 0x0101010101010101ull * fold;
+                  unsigned k = 0;
+                  for (; k + 8 <= row; k += 8) {
+                     uint64_t v;
+                     memcpy(&v, src + k, 8);
+                     v ^= f64;
+                     memcpy(dst + k, &v, 8);
+                  }
+                  for (; k < row; k++)
+                     dst[k] = src[k] ^ fold;
+               }
+               if (line > row)
+                  memset(dst + row, 0, line - row);
             }
          } else if (input_channels == 1) {
             unsigned n = 0;
@@ -1549,25 +1582,27 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
              * capture, probe-D2 impulses 2026-08-22): 8 bytes per pixel
              * carrying 8 channels, planar 8-channel surfaces of stride
              * W*H*8; all CNA/DPU strides are in 8-byte units. */
-            unsigned n = 0;
             unsigned surf_pad =
                rkt_surf_px(input_width * input_height) -
                input_width * input_height;
+            unsigned px = input_width * input_height;
+            uint64_t *dst64 = (uint64_t *)map;
+            uint8_t pad_byte = zero_point - 0x80;
+            uint64_t pad64 = 0x0101010101010101ull * pad_byte;
+            /* One 8-byte pixel per store: the BO mapping is not cached. */
             for (int u = 0; u < DIV_ROUND_UP(input_channels, 8); u++) {
-               for (int y = 0; y < input_height; y++) {
-                  for (int x = 0; x < input_width; x++) {
-                     for (int c = 0; c < 8; c++) {
-                        unsigned input_channel = c + u * 8;
-                        if (input_channel < input_channels)
-                           map[n++] = (input_in[y][x][input_channel] ^ fold) -
-                                      0x80;
-                        else
-                           map[n++] = zero_point - 0x80;
-                     }
-                  }
+               unsigned c0 = u * 8;
+               unsigned nc = MIN2(8u, input_channels - c0);
+               const uint8_t *src = (const uint8_t *)input_in + c0;
+               for (unsigned p = 0; p < px; p++, src += input_channels) {
+                  uint64_t v = pad64;
+                  for (unsigned c = 0; c < nc; c++)
+                     v = (v & ~(0xffull << (8 * c))) |
+                         ((uint64_t)(uint8_t)((src[c] ^ fold) - 0x80) << (8 * c));
+                  *dst64++ = v;
                }
-               for (unsigned p = 0; p < surf_pad * 8; p++)
-                  map[n++] = zero_point - 0x80;
+               for (unsigned p = 0; p < surf_pad; p++)
+                  *dst64++ = pad64;
             }
          }
 
@@ -1614,6 +1649,19 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
             : 0xc00;
       uint32_t last_int_mask = last_op->is_pool ? pool_int_mask : 0x300;
 
+      if (prof_on()) {
+         unsigned n_copy = 0, n_up = 0, n_pool = 0, n_silu = 0;
+         util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op) {
+            n_copy += op->weights_width == 1 && op->weights_height == 1 &&
+                      !op->is_pool && !op->is_upsample && op->output_channels == op->input_channels &&
+                      !op->silu && op->stride == 1;
+            n_up += op->is_upsample;
+            n_pool += op->is_pool;
+            n_silu += op->silu;
+         }
+         fprintf(stderr, "rkt prof: %u ops (%u silu, %u pool, %u upsample, ~%u 1x1 same-C), %u tasks\n",
+                 num_ops, n_silu, n_pool, n_up, n_copy, total_tasks);
+      }
       struct drm_rocket_task *tasks = calloc(total_tasks, sizeof(*tasks));
       /* 0 convolution stream, 1 PPU pool chunk, 2 DPU-only upsample. */
       uint8_t *task_is_pool = calloc(total_tasks, sizeof(uint8_t));
@@ -1806,8 +1854,12 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    submit.jobs = (uint64_t)util_dynarray_begin(&jobs);
    submit.job_count = util_dynarray_num_elements(&jobs, struct drm_rocket_job);
 
+   double t1 = prof_ms();
    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit);
    assert(ret == 0);
+   if (prof_on())
+      fprintf(stderr, "rkt prof: pack %.2f ms, submit %.2f ms\n", t1 - t0,
+              prof_ms() - t1);
 
    util_dynarray_foreach (&jobs, struct drm_rocket_job, job) {
       free((void *)job->in_bo_handles);
@@ -1829,6 +1881,7 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
    struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
 
    DBG("Processing output\n");
+   double tw = 0, tu = 0, tstart = prof_ms();
 
    for (int i = 0; i < outputs_count; i++) {
       unsigned idx = output_idxs[i];
@@ -1885,17 +1938,18 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
        * 28*28*8 for the 28x28 probe).  The previous 16-channel unpack only
        * looked correct on channel-uniform fills. */
       uint8_t(*output_in)[out_h][out_w][8];
-      uint8_t(*output_out)[out_w][out_c];
 
       DBG("Before pipe_buffer_map\n");
+      double tm = prof_ms();
       raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
                                    &transfer);
+      tw += prof_ms() - tm;
+      double tu0 = prof_ms();
       DBG("After pipe_buffer_map\n");
 
       DBG("Converting data\n");
 
       output_in = (void *)raw_output;
-      output_out = (void *)outputs[i];
 
       if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
          rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
@@ -1914,27 +1968,39 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          float rq_scale = requant ? operation->output_scale /
                                        operation->orig_output_scale
                                   : 1.0f;
-         for (int oc = 0; oc < out_c; oc++) {
-            unsigned g = oc / 8, c = oc % 8;
-            for (unsigned y = 0; y < rows; y++) {
-               for (unsigned x = 0; x < cols; x++) {
-                  uint8_t q = raw[g * surf + (y * cols + x) * 8 + c] + 0x80;
+         /* One 8-byte pixel per load from the (uncached) BO, then the
+          * channel bytes scatter into the NHWC user buffer. */
+         unsigned px = rows * cols;
+         uint8_t *ubuf = (uint8_t *)outputs[i];
+         for (unsigned g = 0; g < DIV_ROUND_UP(out_c, 8); g++) {
+            unsigned c0 = g * 8;
+            unsigned nc = MIN2(8u, out_c - c0);
+            const uint64_t *src64 = (const uint64_t *)(raw + g * surf);
+            uint8_t *dst = ubuf + c0;
+            for (unsigned p = 0; p < px; p++, dst += out_c) {
+               uint64_t v = src64[p];
+               for (unsigned c = 0; c < nc; c++) {
+                  uint8_t q = (uint8_t)(v >> (8 * c)) + 0x80;
                   if (requant) {
                      float r = (float)operation->orig_output_zero_point +
                                ((int)q - (int)operation->output_zero_point) *
                                   rq_scale;
                      q = (uint8_t)CLAMP(lrintf(r), 0, 255);
                   }
-                  output_out[y][x][oc] = q ^ fold;
+                  dst[c] = q ^ fold;
                }
             }
          }
       }
 
       DBG("Converted data\n");
+      tu += prof_ms() - tu0;
 
       pipe_buffer_unmap(pcontext, transfer);
    }
+   if (prof_on())
+      fprintf(stderr, "rkt prof: wait %.2f ms, unpack %.2f ms (%d outputs, total %.2f)\n",
+              tw, tu, outputs_count, prof_ms() - tstart);
 
    DBG("Processed output\n");
 }
