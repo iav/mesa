@@ -69,10 +69,10 @@ calc_weights_banks(struct rkt_operation *operation)
    entries = DIV_ROUND_UP(bytes, CBUF_ENTRY_SIZE);
    banks = DIV_ROUND_UP(entries, CBUF_ENTRIES_PER_BANK);
 
-   /* TEST (iav RE, 2026-08-21): the vendor gives this layer one weight bank and
-    * seven data banks (CBUF_CON0 0x17); with the extra bank mesa keeps two and
-    * six, and the 224-wide RGB layer then stalls on its second band. */
-   /* banks++; */
+   /* RK3568 (RE 2026-08-21): no spare weight bank.  The vendor gives the
+    * 224-wide RGB first layer one weight bank and seven data banks
+    * (CBUF_CON0 0x17); with an extra weight bank mesa kept two and six, and
+    * that layer stalled on its second band. */
 
    return banks;
 }
@@ -125,7 +125,7 @@ fill_task(struct rkt_ml_subgraph *subgraph,
     * (mobilenet_v2 RE 2026-08-23).  The old align-to-32 made the DPU wait
     * for surfaces that never come on Cout=16 convs, so every band task
     * after the first produced nothing (op2).  Matches the vendor's FC task
-    * too (mobilenet_v1 t50: 1001 -> 1008).  RKT_OUTALIGN overrides. */
+    * too (mobilenet_v1 t50: 1001 -> 1008). */
    task->output_channels = align(MAX2(oc_eff, 16), 16);
    /* Depthwise announces the full 32-wide group even when fewer channels
     * are real (vendor probe-DW16k1: ORIG_CHANNEL=15, CHANNEL=31, CORE
@@ -134,24 +134,15 @@ fill_task(struct rkt_ml_subgraph *subgraph,
     * 2026-08-24, layer-dw1x1 C=16). */
    if (operation->depthwise)
       task->output_channels = align(MAX2(oc_eff, 32), 32);
-   if (getenv("RKT_OUTALIGN")) {
-      unsigned a = atoi(getenv("RKT_OUTALIGN"));
-      task->output_channels = align(oc_eff, a);
-   }
    if (operation->depthwise && operation->input_channels > 32) {
       task->output_channels_real = 32;
       task->output_channels = 32;
    }
-   /* TEST (iav RE, 2026-08-21): RK3568 wants the real channel count on
-    * depthwise.  The vendor stream carries 32 channels for every 32-channel
-    * depthwise layer of mobilenet_v1 (DPU_DATA_CUBE_CHANNEL 0x001f001f),
-    * while this doubling made mesa announce 64 to the DPU, which then waited
-    * for data that never arrived and stalled right after CNA. */
-   if (operation->depthwise && false) {
-      if (task->output_channels_real <= 32)
-         task->output_channels *= 2;
-      task->output_channels = align(task->output_channels, 64);
-   }
+   /* RK3568 (RE 2026-08-21): depthwise announces the real channel count.
+    * The vendor stream carries 32 channels for every 32-channel depthwise
+    * layer of mobilenet_v1 (DPU_DATA_CUBE_CHANNEL 0x001f001f); the RK3588
+    * path's doubling announced 64 to the DPU, which then waited for data
+    * that never arrived and stalled right after CNA. */
 
    task->output_zero_point = operation->output_zero_point;
    task->output_scale = operation->output_scale;
@@ -416,7 +407,7 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
          1;
       cur_task->atomic_count = cur_task->output_width * cur_task->output_height;
 
-      /* TEST (iav RE, 2026-08-22): trim the band to the rows the convolution
+      /* RK3568 (RE 2026-08-22): trim the band to the rows the convolution
        * actually consumes.  Taking every available CBUF slice leaves a spare
        * input row whenever the slice count is not congruent to the kernel
        * height modulo the stride -- for the 224-wide first layer of

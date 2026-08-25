@@ -18,39 +18,19 @@ emit_raw(struct util_dynarray *regs, uint32_t target, uint32_t reg,
 
    util_dynarray_append(regs, packed_value);
 
-   /* TEST (iav RE, 2026-08-21): RKT_DUMP=1 prints the emitted command stream so
-    * it can be diffed against the vendor stream extracted from a .rknn. */
+   /* RKT_DUMP=1 prints the emitted command stream so it can be diffed
+    * against the vendor stream extracted from a .rknn (tools/rknn_diff.py). */
    if (getenv("RKT_DUMP"))
       fprintf(stderr, "rkt regcmd %016llx\n", (unsigned long long)packed_value);
 }
 
-/* TEST (iav/droid RE session): optional overrides with the vendor-exact
- * values for THE reference conv2d (80x80x16 -> 40x40x128, 5x5 s2) from the
- * MR !42134 byte-exact diff table.  Enabled with RKT_VENDOR_OVR=1.
- */
 #include <stdlib.h>
 #include <stdio.h>
-static const struct { uint32_t reg; uint32_t val; } rkt_test_ovr[] = {
-   { 0x1010, 0x00000070 },  /* CNA_CONV_CON2 */
-   { 0x1018, 0x00000000 },  /* CNA_CONV_CON4 */
-   { 0x1044, 0x00500028 },  /* CNA_CBUF_CON1 */
-   { 0x1078, 0x00171c07 },  /* CNA_DMA_CON0 */
-   /* 0x107c, 0x1080, 0x40c0 removed: now produced by proper formulas in
-    * rkt_task.c (line_stride=Win, surf_stride=Win*Hin, surf_add=Wout*Hout). */
-};
 
 static void
 emit(struct util_dynarray *regs, uint32_t reg, uint32_t value)
 {
    uint32_t target = rkt_get_target(reg) + 0x1;
-   if (getenv("RKT_VENDOR_OVR")) {
-      for (unsigned i = 0; i < ARRAY_SIZE(rkt_test_ovr); i++) {
-         if (rkt_test_ovr[i].reg == reg) {
-            value = rkt_test_ovr[i].val;
-            break;
-         }
-      }
-   }
    emit_raw(regs, target, reg, value);
 }
 
@@ -77,11 +57,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * reuse bit). */
       struct split_task *prev = util_dynarray_element(
          &operation->tasks, struct split_task, task_num - 1);
-      /* TEST (iav RE 2026-08-23): RKT_NO_WREUSE=1 disables the CBUF weight
-       * reuse bit on follow-up band tasks — probing the band-2 constant
-       * output on small-weight convs (mobilenet_v2 op2, 512 B). */
-      if (prev->channel_group == task->channel_group &&
-          !getenv("RKT_NO_WREUSE"))
+      if (prev->channel_group == task->channel_group)
          con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
    }
 
@@ -134,7 +110,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * for int8 mode (32 kernels per group). FEATURE_GRAINS per TRM formula
     * = y_stride + weight_height + 1 (suggested by TRM). The old "+50" value
     * was a hack — TRM-correct formula tested 2026-05-21. */
-   /* TEST (iav RE, 2026-08-21): the vendor leaves KERNEL_GROUP at zero in all
+   /* RK3568 (RE 2026-08-21): the vendor leaves KERNEL_GROUP at zero in all
     * 51 tasks of mobilenet_v1, including layers with 512 and 1001 kernels.
     * Mesa's kernels/32 - 1 underflows to 0xff on depthwise, where kernels is
     * 1 -- and depthwise is exactly what stalls after CNA. */
@@ -145,19 +121,16 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * run unstable).  The vendor's 51 mobilenet_v1 tasks all match
     *   stride_y + kh + stride_y * ((Wout < 28) + (Wout < 14))
     * (1x1: 2/3/4 for W>=28/14/7; dw s1: 4/5/6; dw s2: 5/7/9), except the
-    * Wout==1 cases (FC=1, avgpool=kh) which keep their special values.
-    * RKT_GRAINS overrides for probing. */
+    * Wout==1 cases (FC=1, avgpool=kh) which keep their special values. */
    unsigned grains;
    if (task->input_width == 1 && task->input_height == 1)
       grains = 1;
    else {
       grains = task->stride_y + task->weights_height;
-      if (task->output_width > 1 && !getenv("RKT_GRAINS_OLD"))
+      if (task->output_width > 1)
          grains += task->stride_y * ((task->output_width < 28 ? 1 : 0) +
                                      (task->output_width < 14 ? 1 : 0));
    }
-   if (getenv("RKT_GRAINS"))
-      grains = atoi(getenv("RKT_GRAINS"));
    EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(grains));
    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
@@ -168,9 +141,8 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * register MUST be non-zero or CNA's OP_ENABLE entry is rejected.
     * Use input_width * input_height * input_channels as a safe per-task
     * input byte count. */
-   /* TEST (iav RE, 2026-08-21): the vendor writes RGB_BYTELENGTH only for the
-    * ARGB first layer and leaves this at zero everywhere else. */
-   /* ARGB: the vendor writes W * H * 9 here for the RGB first layer. */
+   /* RK3568 (RE 2026-08-21): the vendor writes RGB_BYTELENGTH (W * H * 9)
+    * only for the ARGB first layer and leaves it at zero everywhere else. */
    EMIT(REG_CNA_CONV_CON4,
         task->input_channels_real == 3
            ? CNA_CONV_CON4_RGB_BYTELENGTH(task->input_width *
@@ -200,15 +172,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_CNA_CBUF_CON0, con0);
 
-   /* TEST (iav RE, 2026-08-21): the upper half of CBUF_CON1 carries the input
+   /* RK3568 (RE 2026-08-21): the upper half of CBUF_CON1 carries the input
     * width in the vendor stream (0x00500028 for the 80-wide reference conv). */
    emit_raw(regs, CNA | 0x1, REG_CNA_CBUF_CON1,
             ((task->input_channels_real == 3 ? align(task->input_width, 32)
                                              : task->input_width)
              << 16) |
-               (getenv("RKT_ENTV")
-                   ? task->input_width * task->input_channels / 32
-                   : task->input_data_entries));
+               task->input_data_entries);
 
    if (task->input_channels_real == 3) {
       /* ARGB CVT: (x - 128) * 16384 >> 14 = x - 128 -- shift the raw uint8
@@ -246,7 +216,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_CNA_CVT_CON4,
            CNA_CVT_CON4_CVT_SCALE3(scale) | CNA_CVT_CON4_CVT_OFFSET3(offset));
    } else {
-      /* TEST (iav RE, 2026-08-21): the vendor writes 0xa here for all 42
+      /* RK3568 (RE 2026-08-21): the vendor writes 0xa here for all 42
        * non-ARGB tasks of mobilenet_v1 -- DATA_SIGN and CVT_TYPE set, but
        * CVT_BYPASS clear.  The converter stays in the path. */
       EMIT(REG_CNA_CVT_CON0, CNA_CVT_CON0_DATA_SIGN(1) |
@@ -259,7 +229,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
 
    EMIT(REG_CNA_FC_CON0, 0);
    EMIT(REG_CNA_FC_CON1, 0);
-   /* TEST (iav RE, 2026-08-21): on RK3568 the pad value lives in the upper half
+   /* RK3568 (RE 2026-08-21): the pad value lives in the upper half
     * of PAD_CON0, not in the separate PAD_CON1 register registers.xml lists --
     * the vendor never writes 0x1184 at all.  Its PAD_CON0 is 0xff800000 /
     * 0xff800011 for every layer whose input zero point is 0 (that is -128 once
@@ -281,7 +251,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * length. Mesa previously omitted this field, leaving it 0 which causes
     * CNA to fetch zero feature data per surface on RK3568. Set to input
     * width as a safe default — matches per-row fetch count. */
-   /* TEST (iav RE, 2026-08-21): the vendor writes the same 0x00171c07 here in
+   /* RK3568 (RE 2026-08-21): the vendor writes the same 0x00171c07 here in
     * all 44 convolution tasks of mobilenet_v1 and all 23 of resnet18, across
     * every geometry -- FETCH_PIXEL_LEN is a constant 28, not input_width, and
     * both burst lengths are 7, not 15. */
@@ -333,11 +303,6 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       emit_raw(regs, CNA | 0x1, 0x1134, 0);          /* DCOMP_AMOUNT1 */
       emit_raw(regs, CNA | 0x1, 0x1138, 0);          /* DCOMP_AMOUNT2 */
       emit_raw(regs, CNA | 0x1, 0x113c, 0);          /* DCOMP_AMOUNT3 */
-   if (getenv("RKT_STRICT")) {
-      unsigned r;
-      for (r = 0x1210; r <= 0x1230; r += 4)
-         emit_raw(regs, CNA | 0x1, r, 0);
-   }
       emit_raw(regs, CNA | 0x1, 0x1140, 0);          /* DCOMP_AMOUNT4 */
       emit_raw(regs, CNA | 0x1, 0x1144, 0);          /* DCOMP_AMOUNT5 */
       emit_raw(regs, CNA | 0x1, 0x1148, 0);          /* DCOMP_AMOUNT6 */
@@ -369,7 +334,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    if (operation->depthwise)
       misc_cfg |= CORE_MISC_CFG_DW_EN(1);
 
-   /* TEST (iav RE, 2026-08-21): on RK3568 the CORE block map is one slot lower
+   /* RK3568 (RE 2026-08-21): the CORE block map is one slot lower
     * than registers.xml claims -- the xml has a spurious MAC_GATING at 0x300c
     * which shifts everything after it.  The vendor command stream (all 44
     * convolution tasks of mobilenet_v1) writes:
@@ -380,7 +345,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * CLIP_TRUNCATE (real 0x3018) is not written at all.
     * With the xml offsets mesa told CORE its output was 3 wide and 1 high,
     * so CORE produced nothing and the DPU interrupt never arrived. */
-   /* TEST (iav RE, 2026-08-21): CMAC MISC_CFG sits at 0x200c, the same slot
+   /* RK3568 (RE 2026-08-21): CMAC MISC_CFG sits at 0x200c, the same slot
     * within its block as CORE's at 0x300c.  The vendor sets QD_EN there for
     * every task and adds DW_EN for depthwise; mesa never wrote it at all. */
    emit_raw(regs, 0x401, 0x200c, operation->depthwise ? 0x3 : 0x1);
@@ -420,7 +385,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            task->channel_group *
               rkt_surf_px(operation->output_width * operation->output_height) *
               32);
-   /* TEST (iav RE, 2026-08-21): the vendor stream carries output_width *
+   /* RK3568 (RE 2026-08-21): the vendor stream carries output_width *
     * output_height / 2 here, half of what mesa emits, on all 44 convolution
     * tasks of mobilenet_v1 (checked against the full output tensor, not the
     * per-task band).  DPU_SURFACE_ADD at 0x40c0 keeps the undivided value. */
@@ -447,9 +412,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       /* Full [bias][ow][mul] BS stream (vendor scheme, RE 2026-08-22):
        * BS_CFG 0x148, multiplier from the stream with shift 14 (0xe01),
        * OW source = stream (0x125 conv / 0x36d dw), OW_OP unused. */
-      EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG")
-                              ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16)
-                              : 0x148);
+      EMIT(REG_DPU_BS_CFG, 0x148);
       EMIT(REG_DPU_BS_ALU_CFG, 0);
       emit_raw(regs, DPU | 0x1, REG_DPU_BS_MUL_CFG, 0xe01);
       EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
@@ -457,7 +420,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
                operation->depthwise ? 0x36d : 0x125);
       EMIT(REG_DPU_BS_OW_OP, 0);
    } else {
-      EMIT(REG_DPU_BS_CFG, getenv("RKT_BSCFG") ? (uint32_t)strtoul(getenv("RKT_BSCFG"), NULL, 16) : 0x158);
+      EMIT(REG_DPU_BS_CFG, 0x158);
       EMIT(REG_DPU_BS_ALU_CFG, 0);
       EMIT(REG_DPU_BS_MUL_CFG, 0);
       EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
@@ -475,13 +438,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
    }
 
-   if (!getenv("RKT_NOWDMA")) {
-      EMIT(REG_DPU_WDMA_SIZE_0,
-           DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
-      EMIT(REG_DPU_WDMA_SIZE_1,
-           DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
-              DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
-   }
+   EMIT(REG_DPU_WDMA_SIZE_0,
+        DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
+   EMIT(REG_DPU_WDMA_SIZE_1,
+        DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
+           DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
    if (operation->relu) {
       /* Fused relu/relu6 the vendor way (mobilenet_v1 t0: BN_CFG 0x92,
        * RELUX_CMP 6/(si*sw)): the BN stage clamps the accumulator to
@@ -628,7 +589,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr +
            task->channel_group * 32 * (operation->per_channel ? 8 : 4));
-   /* TEST (iav RE, 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
+   /* RK3568 (RE 2026-08-21): DPU_RDMA 0x5024 sits right after BS_BASE_ADDR
     * and is absent from registers.xml, so mesa never writes it.  The vendor
     * stream in every .rknn writes output_channels - 1 there for all 51 tasks
     * of mobilenet_v1 (10 distinct values, all matching).  Without it the bias
@@ -675,11 +636,8 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
        * three-operand BRDMA stream (DATA_USE=7) the old BURST_LEN=15 |
        * MRDMA_DISABLE combination scrambles which stream halfword lands in
        * which BS operand lane. */
-      if (getenv("RKT_FEAT4000"))
-         rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(8);
-      else
-         rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
-                               DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
+      rdma_feat_mode_cfg |= DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
+                            DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1);
    }
 
    if (operation->depthwise)
@@ -802,13 +760,8 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    PPU_WORD(PPU_TARGET, out_h - 1, 0x601c);
    PPU_WORD(PPU_TARGET, channels - 1, 0x6020);
    /* OPERATION_MODE_CFG: [1:0] method (0 avg / 1 max), [4] the vendor's
-    * flying bit (set even though the input goes through PPU_RDMA --
-    * RKT_PPU_MODE overrides for experiments). */
-   PPU_WORD(PPU_TARGET,
-            getenv("RKT_PPU_MODE")
-               ? strtol(getenv("RKT_PPU_MODE"), NULL, 0)
-               : (operation->pool_avg ? 0x10 : 0x11),
-            0x6024);
+    * flying bit (set even though the input goes through PPU_RDMA). */
+   PPU_WORD(PPU_TARGET, operation->pool_avg ? 0x10 : 0x11, 0x6024);
    PPU_WORD(PPU_TARGET,
             (operation->stride - 1) << 20 | (operation->stride - 1) << 16 |
                (operation->weights_height - 1) << 8 |
@@ -849,14 +802,6 @@ rkt_fill_ppu_regcmd(struct rkt_ml_subgraph *subgraph,
    PPU_WORD(PPU_RDMA_TARGET, in_w * 8, 0x7024); /* SRC_LINE_STRIDE */
    PPU_WORD(PPU_RDMA_TARGET, in_surf, 0x7028);  /* SRC_SURF_STRIDE */
    PPU_WORD(PPU_RDMA_TARGET, 0, 0x7030);        /* RDMA_DATA_FORMAT */
-
-   /* Experiment knob: explicit per-unit OP_ENABLE words before the tail
-    * (the conv units must start via the broadcast, but the PPU pair may
-    * need its own). */
-   if (getenv("RKT_PPU_UNITEN")) {
-      PPU_WORD(PPU_RDMA_TARGET, 0x1, 0x7008);
-      PPU_WORD(PPU_TARGET, 0x1, 0x6008);
-   }
 
    /* PC tail: address/amount patched by the cross-operation chain; the
     * broadcast starts PPU + PPU_RDMA (units 5 and 6). */

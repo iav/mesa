@@ -34,8 +34,7 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
 
    input_channels = MAX2(input_channels, FEATURE_ATOMIC_SIZE);
 
-   /* TEST (iav RE 2026-08-22): RK3568 half-width weight atomic experiment */
-   unsigned watom = getenv("RKT_WK") ? atoi(getenv("RKT_WK")) : WEIGHT_ATOMIC_SIZE;
+   unsigned watom = WEIGHT_ATOMIC_SIZE;
 
    output_channels = align(output_channels, 2);
    if (rkt_is_depthwise(poperation))
@@ -167,37 +166,6 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
       assert(n <= weights_size);
       goto packed;
    }
-   /* TEST (iav RE 2026-08-22): RKT_WLAY=1 — candidate RK3568 layout
-    * [kernel group of 16][tap y*3+x][oc2 0..15][ic]. */
-   if (getenv("RKT_WLAY") && atoi(getenv("RKT_WLAY")) == 2) {
-      /* плоская укладка [oc][ty][tx][ic] для картирования */
-      for (int oc = 0; oc < output_channels; oc++)
-         for (int y = 0; y < weights_height; y++)
-            for (int x = 0; x < weights_width; x++)
-               for (int ic = 0; ic < input_channels; ic++)
-                  weights_out[n++] =
-                     (oc < output_channels_real && ic < input_channels_real)
-                        ? weights_in[oc][x][y][ic] - 0x80 : 0;
-      goto packed;
-   }
-   if (getenv("RKT_WLAY")) {
-      for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, 16); oc1++) {
-         for (int y = 0; y < weights_height; y++) {
-            for (int x = 0; x < weights_width; x++) {
-               for (int oc2 = 0; oc2 < 16; oc2++) {
-                  for (int ic = 0; ic < input_channels; ic++) {
-                     unsigned oc = oc1 * 16 + oc2;
-                     if (oc >= output_channels_real || ic >= input_channels_real)
-                        weights_out[n++] = 0;
-                     else
-                        weights_out[n++] = weights_in[oc][x][y][ic] - 0x80;
-                  }
-               }
-            }
-         }
-      }
-      goto packed;
-   }
    for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, watom);
         oc1++) {
       for (int ic1 = 0; ic1 < input_channels_1; ic1++) {
@@ -235,16 +203,6 @@ packed:
       FILE *f = fopen(getenv("RKT_WDUMP"), "wb");
       if (f) { fwrite(weights_out, 1, weights_size, f); fclose(f); }
    }
-   /* TEST (iav RE 2026-08-22): RKT_WPOKE=<byte offset> — обнулить всю
-    * упаковку и поставить один байт 127: выход покажет, какой (oc,tap,ic)
-    * этот байт кормит. */
-   if (getenv("RKT_WPOKE")) {
-      unsigned off = strtoul(getenv("RKT_WPOKE"), NULL, 0);
-      memset(weights_out, 0, weights_size);
-      if (off < weights_size)
-         weights_out[off] = 127;
-   }
-
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
       static int task = 0;
       rkt_dump_buffer(weights_out, "weights", 0, task++, 0, weights_size);
@@ -356,7 +314,6 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
             bias32[j] = 0;
             ow16[j] = 0;
             mul16[j] = 1 << 14;
-         ow16[j] = 0; /* PROBE4 */
             continue;
          }
 
@@ -371,24 +328,6 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
          mul16[j] = (uint16_t)lrintf((wscales[oc] / s_wmax) * (1 << 14));
          if (getenv("RKT_MULSH"))
             mul16[j] = 1 << (14 - atoi(getenv("RKT_MULSH")));
-         if (getenv("RKT_WPOKE")) {
-            bias32[j] = 0; ow16[j] = 0; mul16[j] = 1 << 14;
-         }
-         /* TEST probes: RKT_PROBE selects synthetic stream contents */
-         if (getenv("RKT_PROBE")) {
-            int pr = atoi(getenv("RKT_PROBE"));
-            uint16_t *slots = (uint16_t *)(stream + g * 32);
-            unsigned k;
-            switch (pr) {
-            case 1: /* staircase bias, ow 0, mul 1<<14 */
-               bias32[j] = (oc + 1) * 2048; ow16[j] = 0; mul16[j] = 1 << 14;
-               break;
-            case 5: /* globally unique small u16 in every slot */
-               for (k = 0; k < 16; k++)
-                  slots[k] = 4 * (g * 16 + k + 1);
-               break;
-            }
-         }
       }
    }
 

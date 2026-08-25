@@ -600,18 +600,6 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
           operation->conv.dilation_height_factor == 1)
          supported = true;
 
-      /* RK3568: a fully-connected-shaped convolution whose weights exceed
-       * the 256 KiB CBUF (e.g. the final 1024->1001 1x1 of mobilenet_v1)
-       * needs the vendor fp16 FC mode, which is not implemented yet -- the
-       * current conv path wedges on it (job timeout). */
-      {
-         unsigned kernels = weight_tensor->dims[0];
-         unsigned wbytes = kernels * weight_tensor->dims[1] *
-                           weight_tensor->dims[2] * weight_tensor->dims[3];
-         if (wbytes > 7 * CBUF_BANK_SIZE && getenv("RKT_NO_FC"))
-            supported = false;
-      }
-
       break;
    }
    case PIPE_ML_OPERATION_TYPE_ADD:
@@ -1425,7 +1413,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          /* RK3568 PC task-DMA mode (vendor rknpu_job): build the 40-byte
           * descriptor array so the PC unit walks the whole chain itself --
           * no CPU stepping between tasks, no ping-pong config races. */
-         if (!getenv("RKT_NO_DESC") && task_count > 0) {
+         if (task_count > 0) {
             struct pc_task_desc {
                uint32_t flags, op_idx, enable_mask, int_mask, int_clear,
                         int_status, regcfg_amount, regcfg_offset;
@@ -1446,8 +1434,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                d[ti].int_mask = 0x300;
                d[ti].int_clear = 0x1ffff;
                d[ti].int_status = 0;
-               d[ti].regcfg_amount = t->regcfg_amount - 1 +
-                  (getenv("RKT_DESC_AM") ? atoi(getenv("RKT_DESC_AM")) : 0);
+               d[ti].regcfg_amount = t->regcfg_amount - 1;
                d[ti].regcfg_offset = 0;
                d[ti].regcmd_addr = t->regcfg_addr;
                ti++;
