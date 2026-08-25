@@ -80,6 +80,10 @@ struct rkt_resource {
    uint64_t obj_addr;
    uint64_t fake_offset;
    uint64_t bo_size;
+   /* CPU mapping, made on first map and kept for the BO's lifetime: a
+    * fresh mmap per transfer cost a page-fault sweep per invoke (~1 ms
+    * on a 320x320x3 input) and was never unmapped. */
+   void *cpu_map;
 };
 
 static inline struct rkt_resource *
